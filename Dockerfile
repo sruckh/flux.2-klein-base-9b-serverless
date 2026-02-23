@@ -17,12 +17,11 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_DOWNLOAD_TIMEOUT=300 \
     HF_HUB_DISABLE_PROGRESS_BARS=1
 
-# Install Python 3.12 and system dependencies
+# Install Python 3.12 and system dependencies (no python3-pip — use get-pip.py instead)
 RUN apt-get update && apt-get install -y \
     python3.12 \
     python3.12-dev \
     python3.12-venv \
-    python3-pip \
     git \
     wget \
     && rm -rf /var/lib/apt/lists/*
@@ -31,8 +30,11 @@ RUN apt-get update && apt-get install -y \
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
 
-# Upgrade pip
-RUN python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
+# Bootstrap pip via get-pip.py — installs outside apt so upgrades work freely
+RUN wget -q https://bootstrap.pypa.io/get-pip.py -O /tmp/get-pip.py \
+    && python3 /tmp/get-pip.py \
+    && rm /tmp/get-pip.py \
+    && pip install --upgrade setuptools wheel
 
 # Install PyTorch with CUDA 12.8 support
 RUN pip install --no-cache-dir \
