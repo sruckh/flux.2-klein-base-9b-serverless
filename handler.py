@@ -21,7 +21,10 @@ import boto3
 import torch
 from botocore.exceptions import ClientError
 from diffusers import FluxPipeline
-from diffusers.pipelines.flux.pipeline_flux_output import FluxPipelineOutput
+try:
+    from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
+except ImportError:
+    from diffusers.pipelines.flux.pipeline_flux_output import FluxPipelineOutput
 from PIL import Image
 from safetensors.torch import load_file
 
