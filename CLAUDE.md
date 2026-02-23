@@ -18,6 +18,8 @@ This is a **RunPod Serverless** deployment for FLUX.2-klein image generation wit
 **Primary files:**
 - `handler.py` - Main serverless handler (FluxPipeline, presets, validation, generation, S3 upload)
 - `Dockerfile` - Container definition (runpod/base, CUDA 12.8, PyTorch 2.8, Flash Attention 2.8.3)
+
+**Model**: `black-forest-labs/FLUX.2-klein-base-9b-fp8` — FP8-quantized weights (~4.5 GB on disk). Loaded at bf16 by default (upcast at load time); set `DTYPE=float8_e4m3fn` to keep weights in FP8 for native H100 inference.
 - `requirements.txt` - Python dependencies
 - `test_input.json` - Sample API request for testing
 

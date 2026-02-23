@@ -12,7 +12,7 @@ This serverless API generates high-quality images using the **FLUX.2-klein** dif
 ## ✨ Features
 
 - **FLUX.2-klein** - State-of-the-art diffusion model by Black Forest Labs
-- **Custom LoRA Support** - Use trained LoRA weights from HuggingFace or local files
+- **Custom LoRA Support** - Load LoRA weights from HuggingFace, local files, or direct HTTPS URLs
 - **Flash Attention 2** - Memory-efficient attention for faster inference
 - **Dynamic Shift Calculation** - Matches training behavior for optimal results
 - **Optimized Presets** - Research-backed settings for realistic characters, portraits, and more
@@ -26,7 +26,7 @@ This serverless API generates high-quality images using the **FLUX.2-klein** dif
 
 ![Data Flow Diagram](./docs/diagrams/data-flow.svg)
 
-The system follows a modular architecture where RunPod Serverless receives API requests and routes them through the handler pipeline. The FluxPipeline manages model inference with memory optimizations (CPU offload, VAE slicing/tiling) while supporting dynamic LoRA weight loading from HuggingFace Hub or local storage.
+The system follows a modular architecture where RunPod Serverless receives API requests and routes them through the handler pipeline. The FluxPipeline manages model inference with VAE slicing/tiling optimizations while supporting dynamic LoRA weight loading from HuggingFace Hub, local storage, or direct HTTPS URLs.
 
 ### Data Flow Pipeline
 
@@ -55,7 +55,7 @@ cd flux.2-klein-serverless
 docker build -t flux-2-klein-serverless .
 
 # Run locally (GPU required)
-# Note: Set HF_TOKEN if using gated models like black-forest-labs/FLUX.2-klein-9B
+# Note: Set HF_TOKEN if the model is gated on HuggingFace
 docker run --gpus all -p 8000:8000 \
   -e HF_TOKEN=your_huggingface_token \
   flux-2-klein-serverless
@@ -132,7 +132,7 @@ highly detailed skin texture
   "input": {
     "prompt": "a professional portrait photograph of TOK, shot on Sony A7IV, 85mm, photorealistic",
     "preset": "realistic_character",
-    "lora_path": "your-username/your-character-lora",
+    "lora_path": "https://example.com/your-lora.safetensors",
     "lora_scale": 1.0,
     "seed": 42,
     "return_type": "s3"
@@ -148,7 +148,7 @@ highly detailed skin texture
   "return_type": "s3",
   "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-9B",
+    "model_id": "black-forest-labs/FLUX.2-klein-base-9b-fp8",
     "generation_time": "12.34s",
     "preset": "realistic_character",
     "s3_bucket": "your-bucket-name",
@@ -165,7 +165,7 @@ highly detailed skin texture
   "return_type": "base64",
   "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-9B",
+    "model_id": "black-forest-labs/FLUX.2-klein-base-9b-fp8",
     "generation_time": "12.34s",
     "preset": "realistic_character"
   }
@@ -188,20 +188,20 @@ highly detailed skin texture
 | `output_format` | string | `"jpeg"` | Output format: png, jpeg, webp |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
 | `max_sequence_length` | int | `512` | Max text encoder sequence length |
-| `lora_path` | string | `""` | HuggingFace repo ID or local LoRA path |
+| `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
 | `lora_scale` | float | `1.0` | LoRA weight scale (0.0-2.0) |
 
 ### Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-9B` | Base model (requires HF_TOKEN) |
+| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9b-fp8` | Base model |
 | `DEFAULT_LORA_PATH` | `""` | Default LoRA to load |
 | `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA scale |
 | `DEVICE` | `cuda` | Device to run on |
-| `DTYPE` | `bf16` | Data type (bf16/float16/float32) |
+| `DTYPE` | `bf16` | Data type: `bf16`, `float16`, `float32`, `float8`/`float8_e4m3fn` (H100 only) |
 | `USE_FLASH_ATTN` | `true` | Enable Flash Attention 2 |
-| `HF_TOKEN` | `""` | **Required** for gated models (black-forest-labs/FLUX.2-klein-9B) |
+| `HF_TOKEN` | `""` | HuggingFace token — required if model repo is gated |
 
 ### S3 Configuration (Optional)
 
@@ -247,16 +247,16 @@ python flux_train_ui.py
 
 ## 📄 License
 
-This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-base-9B model has its own license terms - refer to the [HuggingFace model card](https://huggingface.co/freudymind/FLUX.2-klein-base-9B).
+This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-base-9B model has its own license terms — refer to the [HuggingFace model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8).
 
 ## 🙏 Acknowledgments
 
 - **[ai-toolkit](https://github.com/ostris/ai-toolkit)** by ostris - Training framework and reference implementation
-- **[FLUX.2](https://huggingface.co/freudymind)** by Freudymind - Base model
+- **[FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8)** by Black Forest Labs - Base model
 - **[RunPod](https://runpod.io)** - Serverless GPU infrastructure
 
 ## 📧 Support
 
 - **This deployment:** Check logs in RunPod console
-- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/freudymind/FLUX.2-klein-base-9B)
+- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8)
 - **Training:** See [ai-toolkit issues](https://github.com/ostris/ai-toolkit/issues)

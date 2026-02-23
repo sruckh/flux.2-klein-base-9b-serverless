@@ -1,5 +1,5 @@
 # RunPod Serverless for FLUX.2-klein-base-9B with LoRA support
-FROM runpod/base:1.0.3-cuda12.8.1-ubuntu24.04
+FROM runpod/base:1.0.3-cuda1281-ubuntu2404
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
@@ -53,11 +53,8 @@ WORKDIR /workspace
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python dependencies (includes boto3 for S3 support)
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Install additional dependencies for S3 support
-RUN pip install --no-cache-dir boto3
 
 # Copy application code
 COPY . .

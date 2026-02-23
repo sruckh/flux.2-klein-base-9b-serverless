@@ -11,7 +11,9 @@ import base64
 import io
 import json
 import os
+import tempfile
 import time
+import urllib.request
 import uuid
 from typing import Dict, Any, List, Optional, Union
 
@@ -67,7 +69,7 @@ def get_s3_client():
 
 DEFAULT_MODEL_ID = os.getenv(
     "MODEL_ID",
-    "black-forest-labs/FLUX.2-klein-9B"
+    "black-forest-labs/FLUX.2-klein-base-9b-fp8"
 )
 
 DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
@@ -82,6 +84,9 @@ DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "float16": torch.float16,
     "float32": torch.float32,
+    # fp8 keeps weights in FP8 format on H100/Ada GPUs (requires CUDA compute ≥ 8.9)
+    "float8": torch.float8_e4m3fn,
+    "float8_e4m3fn": torch.float8_e4m3fn,
 }
 
 
@@ -158,6 +163,7 @@ PRESETS = {
 
 pipeline: Optional[FluxPipeline] = None
 model_loaded = False
+lora_path_loaded: str = DEFAULT_LORA_PATH
 
 
 # ============================================================================
@@ -336,7 +342,7 @@ def load_lora_weights(
 
     Args:
         pipeline: The FLUX pipeline
-        lora_path: Path or HuggingFace repo ID for LoRA weights
+        lora_path: Path, HuggingFace repo ID, or HTTPS URL for LoRA weights
         lora_scale: Scaling factor for LoRA weights (0.0 to 2.0)
 
     Returns:
@@ -348,25 +354,30 @@ def load_lora_weights(
     print(f"Loading LoRA weights from: {lora_path}")
 
     try:
-        # Check if it's a local file path
-        if os.path.exists(lora_path):
+        if lora_path.startswith(("http://", "https://")):
+            # Download .safetensors from URL to a temporary directory
+            print("Downloading LoRA from URL...")
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_file = os.path.join(tmp_dir, "lora.safetensors")
+                urllib.request.urlretrieve(lora_path, tmp_file)
+                pipeline.load_lora_weights(
+                    tmp_dir, weight_name="lora.safetensors", adapter_name="flux_lora"
+                )
+        elif os.path.exists(lora_path):
             if lora_path.endswith(".safetensors"):
-                # Load safetensors file directly
-                state_dict = load_file(lora_path)
-                # Apply weights to the transformer
-                pipeline.transformer.load_state_dict(state_dict, strict=False)
+                lora_dir = os.path.dirname(lora_path) or "."
+                lora_name = os.path.basename(lora_path)
+                pipeline.load_lora_weights(
+                    lora_dir, weight_name=lora_name, adapter_name="flux_lora"
+                )
             else:
-                # Try loading as HuggingFace repo style
-                pipeline.load_lora_weights(lora_path)
+                pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
         else:
-            # Load from HuggingFace Hub
-            pipeline.load_lora_weights(lora_path)
+            # Load from HuggingFace Hub (repo ID)
+            pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
 
-        # Set adapter scale
-        if hasattr(pipeline, "set_adapters"):
-            pipeline.set_adapters(["default"], adapter_weights=[lora_scale])
-        elif hasattr(pipeline, "_lora_scale"):
-            pipeline._lora_scale = lora_scale
+        # Set adapter scale using the consistent adapter name
+        pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
 
         print(f"LoRA weights loaded with scale: {lora_scale}")
 
@@ -400,27 +411,30 @@ def initialize_pipeline(
     # Get torch dtype
     torch_dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Load the pipeline with HF token for gated models
+    # Use attn_implementation (replaces deprecated use_flash_attention_2 kwarg)
     load_kwargs = {
         "torch_dtype": torch_dtype,
-        "use_flash_attention_2": USE_FLASH_ATTN,
-        "device_map": "auto",
+        "attn_implementation": "flash_attention_2" if USE_FLASH_ATTN else "eager",
     }
-    
+
     # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-9B)
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
-    
+
     pipeline = FluxPipeline.from_pretrained(model_id, **load_kwargs)
+
+    # Move model fully onto the target device for optimal inference performance.
+    # device_map="auto" and enable_model_cpu_offload() are mutually exclusive;
+    # for H100/A100 80 GB the 9B model (~18 GB at bf16) fits entirely in VRAM.
+    pipeline = pipeline.to(DEVICE)
+
+    # VAE memory optimizations — safe to use alongside .to(device)
+    pipeline.vae.enable_slicing()
+    pipeline.vae.enable_tiling()
 
     # Load LoRA if specified
     if lora_path:
         pipeline = load_lora_weights(pipeline, lora_path, lora_scale)
-
-    # Enable memory optimizations
-    pipeline.enable_model_cpu_offload()
-    pipeline.vae.enable_slicing()
-    pipeline.vae.enable_tiling()
 
     # Warm up the pipeline
     print("Warming up pipeline...")
@@ -484,26 +498,26 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Dictionary containing generated images and metadata
     """
-    global pipeline
+    global pipeline, lora_path_loaded
 
     # Initialize pipeline if not already loaded
     if pipeline is None:
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
-        lora_path = job_input.get("lora_path", "")
+        lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
         lora_scale = job_input.get("lora_scale", DEFAULT_LORA_SCALE)
         pipeline = initialize_pipeline(model_id, lora_path, lora_scale)
+        lora_path_loaded = lora_path
 
-    # Handle model or LoRA change
-    current_lora_path = job_input.get("lora_path", "")
+    # Handle LoRA change without reloading the full pipeline
+    current_lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
     current_lora_scale = job_input.get("lora_scale", DEFAULT_LORA_SCALE)
 
-    # Reinitialize if LoRA path changed
-    if current_lora_path != DEFAULT_LORA_PATH:
-        pipeline = initialize_pipeline(
-            job_input.get("model_id", DEFAULT_MODEL_ID),
-            current_lora_path,
-            current_lora_scale
-        )
+    if current_lora_path != lora_path_loaded:
+        if lora_path_loaded:
+            pipeline.unload_lora_weights()
+        if current_lora_path:
+            pipeline = load_lora_weights(pipeline, current_lora_path, current_lora_scale)
+        lora_path_loaded = current_lora_path
 
     # Extract parameters - apply preset first, then override with explicit values
     preset_name = job_input.get("preset", "realistic_character")
@@ -557,6 +571,9 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
 
     shift = calculate_shift(image_seq_len)
 
+    # Apply dynamic shift to the scheduler for this resolution
+    pipeline.scheduler.config.shift = shift
+
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
           f"guidance={guidance_scale}, shift={shift:.4f}")
 
@@ -574,8 +591,8 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
             generator=generator,
             num_images_per_prompt=num_images,
             max_sequence_length=max_sequence_length,
-            # FLUX-specific parameters
-            joint_attention_kwargs={"scale": 1.0},
+            # Pass LoRA scale through attention kwargs when a LoRA is active
+            joint_attention_kwargs={"scale": current_lora_scale} if current_lora_path else None,
         )
 
     generation_time = time.time() - start_time
