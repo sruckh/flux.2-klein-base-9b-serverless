@@ -6,6 +6,8 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    # Required on Ubuntu 24.04 (PEP 668) — safe inside a container
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     DEBIAN_FRONTEND=noninteractive \
     # HuggingFace cache configuration for RunPod network volumes
     HF_HOME=/runpod-volume/huggingface \
