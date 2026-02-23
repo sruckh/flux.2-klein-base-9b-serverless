@@ -1,0 +1,12 @@
+{
+  "input": {
+    "prompt": "a professional portrait photograph of TOK, a young woman with shoulder-length auburn hair and hazel eyes, wearing a casual white blouse, standing on a city street during golden hour, soft natural lighting, shallow depth of field, shot on Sony A7IV, 85mm lens, f/1.8, photorealistic, highly detailed skin texture",
+    "negative_prompt": "cartoon, anime, illustration, drawing, painting, artificial, plastic, blurry, low quality, distorted features, unnatural skin",
+    "preset": "realistic_character",
+    "seed": 42,
+    "num_images": 1,
+    "output_format": "png",
+    "lora_path": "",
+    "lora_scale": 1.0
+  }
+}

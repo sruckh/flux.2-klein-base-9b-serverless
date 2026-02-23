@@ -1,0 +1,34 @@
+# Serena memory files
+.serena/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model weights and outputs
+models/
+lora/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Logs
+*.log
