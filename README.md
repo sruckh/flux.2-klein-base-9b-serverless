@@ -5,19 +5,22 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8.0-orange)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-> A production-ready RunPod serverless deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support.
+> A production-ready RunPod serverless deployment for FLUX.2-klein image generation with custom LoRA weight support.
 
-This serverless API generates high-quality images using the **FLUX.2-klein-base-9B** diffusion model with support for custom LoRA weights. It features optimized presets for ultra-realistic human character generation, flow matching inference, and dynamic shift calculation that matches ai-toolkit training behavior.
+This serverless API generates high-quality images using the **FLUX.2-klein** diffusion model with support for custom LoRA weights. It features optimized presets for ultra-realistic human character generation, flow matching inference, S3 storage with presigned URLs, and dynamic shift calculation that matches ai-toolkit training behavior.
 
 ## ✨ Features
 
-- **FLUX.2-klein-base-9B** - State-of-the-art 9B parameter diffusion model
+- **FLUX.2-klein** - State-of-the-art diffusion model by Black Forest Labs
 - **Custom LoRA Support** - Use trained LoRA weights from HuggingFace or local files
 - **Flash Attention 2** - Memory-efficient attention for faster inference
 - **Dynamic Shift Calculation** - Matches training behavior for optimal results
 - **Optimized Presets** - Research-backed settings for realistic characters, portraits, and more
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, and batch size
-- **Multiple Output Formats** - PNG, JPEG, WebP support with base64 encoding
+- **Multiple Output Formats** - PNG, JPEG, WebP support
+- **S3 Storage** - Upload images to S3 with presigned URLs (no more base64 size limits!)
+- **RunPod Model Cache** - Optimized HuggingFace cache on network volumes
+- **High-Performance Downloads** - Xet storage backend with concurrent downloads
 
 ## 🏗️ Architecture
 
@@ -31,7 +34,7 @@ The system follows a modular architecture where RunPod Serverless receives API r
 2. **Pipeline Init** - FLUX.2 model loaded with optional LoRA weights, memory optimizations enabled
 3. **Parameter Processing** - Preset values applied, dynamic shift calculated based on resolution
 4. **Image Generation** - Flow matching scheduler generates images via FluxPipeline
-5. **Post-Processing** - Images encoded to base64, JSON response with metadata built
+5. **Post-Processing** - Images uploaded to S3 (presigned URL) or encoded to base64, JSON response with metadata built
 
 ## 🚀 Quick Start
 
@@ -52,7 +55,10 @@ cd flux.2-klein-serverless
 docker build -t flux-2-klein-serverless .
 
 # Run locally (GPU required)
-docker run --gpus all -p 8000:8000 flux-2-klein-serverless
+# Note: Set HF_TOKEN if using gated models like black-forest-labs/FLUX.2-klein-9B
+docker run --gpus all -p 8000:8000 \
+  -e HF_TOKEN=your_huggingface_token \
+  flux-2-klein-serverless
 
 # Test the endpoint
 curl -X POST http://localhost:8000/runpod/v1/lgpu/input \
@@ -77,8 +83,11 @@ git push -u origin main
    - Select **GitHub** as source
    - Choose your repository
    - Configure: **Container Disk**: 30 GB, **Min/Max Workers**: 0-10, **GPU**: NVIDIA H100
+   - **Network Volume**: Recommended for model caching (30GB+)
 
-3. **Deploy** - RunPod automatically builds and deploys. Future pushes trigger redeployment.
+3. **Set Environment Variables** (see Configuration section below)
+
+4. **Deploy** - RunPod automatically builds and deploys. Future pushes trigger redeployment.
 
 ## 📖 Documentation
 
@@ -125,19 +134,38 @@ highly detailed skin texture
     "preset": "realistic_character",
     "lora_path": "your-username/your-character-lora",
     "lora_scale": 1.0,
-    "seed": 42
+    "seed": 42,
+    "return_type": "s3"
   }
 }
 ```
 
-**Response Format:**
+**Response Format (S3 - default if configured):**
+```json
+{
+  "image_urls": ["https://s3.amazonaws.com/bucket/flux2-klein/uuid.jpg?X-Amz-Algorithm=..."],
+  "format": "jpeg",
+  "return_type": "s3",
+  "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
+  "metadata": {
+    "model_id": "black-forest-labs/FLUX.2-klein-9B",
+    "generation_time": "12.34s",
+    "preset": "realistic_character",
+    "s3_bucket": "your-bucket-name",
+    "presigned_url_expiry_seconds": 3600
+  }
+}
+```
+
+**Response Format (Base64 - fallback):**
 ```json
 {
   "images": ["<base64_encoded_image>"],
-  "format": "png",
+  "format": "jpeg",
+  "return_type": "base64",
   "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
   "metadata": {
-    "model_id": "freudymind/FLUX.2-klein-base-9B",
+    "model_id": "black-forest-labs/FLUX.2-klein-9B",
     "generation_time": "12.34s",
     "preset": "realistic_character"
   }
@@ -157,7 +185,8 @@ highly detailed skin texture
 | `guidance_scale` | float | `2.5` | CFG scale (lower = more realistic) |
 | `seed` | int | `-1` | Random seed (-1 for random) |
 | `num_images` | int | `1` | Number of images (1-4) |
-| `output_format` | string | `"png"` | Output format: png, jpeg, webp |
+| `output_format` | string | `"jpeg"` | Output format: png, jpeg, webp |
+| `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
 | `max_sequence_length` | int | `512` | Max text encoder sequence length |
 | `lora_path` | string | `""` | HuggingFace repo ID or local LoRA path |
 | `lora_scale` | float | `1.0` | LoRA weight scale (0.0-2.0) |
@@ -166,12 +195,37 @@ highly detailed skin texture
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MODEL_ID` | `freudymind/FLUX.2-klein-base-9B` | Base model |
+| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-9B` | Base model (requires HF_TOKEN) |
 | `DEFAULT_LORA_PATH` | `""` | Default LoRA to load |
 | `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA scale |
 | `DEVICE` | `cuda` | Device to run on |
 | `DTYPE` | `bf16` | Data type (bf16/float16/float32) |
 | `USE_FLASH_ATTN` | `true` | Enable Flash Attention 2 |
+| `HF_TOKEN` | `""` | **Required** for gated models (black-forest-labs/FLUX.2-klein-9B) |
+
+### S3 Configuration (Optional)
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `S3_BUCKET_NAME` | `""` | S3 bucket for image storage |
+| `S3_REGION` | `us-east-1` | AWS region |
+| `S3_ACCESS_KEY_ID` | `""` | AWS access key |
+| `S3_SECRET_ACCESS_KEY` | `""` | AWS secret key |
+| `S3_ENDPOINT_URL` | `""` | Custom S3 endpoint (e.g., MinIO, Wasabi) |
+| `S3_PRESIGNED_URL_EXPIRY` | `3600` | Presigned URL expiry in seconds |
+
+### HuggingFace Performance Tuning
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `HF_HOME` | `/runpod-volume/huggingface` | HuggingFace cache directory |
+| `HF_HUB_CACHE` | `/runpod-volume/huggingface/hub` | Model cache directory |
+| `HF_XET_HIGH_PERFORMANCE` | `1` | Enable high-performance Xet downloads |
+| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` | Concurrent download chunks |
+| `HF_HUB_ETAG_TIMEOUT` | `30` | Timeout for metadata requests |
+| `HF_HUB_DOWNLOAD_TIMEOUT` | `300` | Timeout for file downloads |
+
+**Note:** When `S3_BUCKET_NAME` is configured, images are uploaded to S3 and a presigned URL is returned instead of base64. This avoids payload size limits and improves response times.
 
 ## 🎨 Training Custom LoRAs
 

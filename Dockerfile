@@ -6,7 +6,18 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    # HuggingFace cache configuration for RunPod network volumes
+    HF_HOME=/runpod-volume/huggingface \
+    HF_HUB_CACHE=/runpod-volume/huggingface/hub \
+    TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub \
+    # HuggingFace download performance optimizations
+    HF_XET_HIGH_PERFORMANCE=1 \
+    HF_XET_NUM_CONCURRENT_RANGE_GETS=32 \
+    HF_HUB_ETAG_TIMEOUT=30 \
+    HF_HUB_DOWNLOAD_TIMEOUT=300 \
+    # Disable progress bars for cleaner logs
+    HF_HUB_DISABLE_PROGRESS_BARS=1
 
 # Install Python 3.12 and system dependencies
 RUN apt-get update && apt-get install -y \
@@ -45,11 +56,17 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install additional dependencies for S3 support
+RUN pip install --no-cache-dir boto3
+
 # Copy application code
 COPY . .
 
-# Create directory for models and LoRA weights
-RUN mkdir -p /workspace/models /workspace/lora
+# Create directories for models, LoRA weights, and HuggingFace cache
+RUN mkdir -p /workspace/models /workspace/lora /runpod-volume/huggingface
+
+# Set proper permissions for cache directory
+RUN chmod -R 777 /runpod-volume
 
 # Set the handler as the entrypoint
 CMD ["python3", "handler.py"]

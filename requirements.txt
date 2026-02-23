@@ -27,3 +27,6 @@ tqdm>=4.67.0
 
 # Optional: for better performance
 protobuf>=5.29.0
+
+# S3 storage for image uploads
+boto3>=1.35.0

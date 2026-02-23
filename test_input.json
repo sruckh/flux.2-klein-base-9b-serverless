@@ -5,7 +5,8 @@
     "preset": "realistic_character",
     "seed": 42,
     "num_images": 1,
-    "output_format": "png",
+    "output_format": "jpeg",
+    "return_type": "s3",
     "lora_path": "",
     "lora_scale": 1.0
   }

@@ -12,9 +12,12 @@ import io
 import json
 import os
 import time
+import uuid
 from typing import Dict, Any, List, Optional, Union
 
+import boto3
 import torch
+from botocore.exceptions import ClientError
 from diffusers import FluxPipeline
 from diffusers.pipelines.flux.pipeline_flux_output import FluxPipelineOutput
 from PIL import Image
@@ -26,12 +29,45 @@ from runpod.serverless.utils.rp_validator import validate
 
 
 # ============================================================================
+# S3 Configuration
+# ============================================================================
+
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
+S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "")
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")  # For S3-compatible services
+S3_PRESIGNED_URL_EXPIRY = int(os.getenv("S3_PRESIGNED_URL_EXPIRY", "3600"))  # 1 hour default
+
+# HuggingFace Token for gated model access
+HF_TOKEN = os.getenv("HF_TOKEN", "")
+
+
+def get_s3_client():
+    """Initialize and return S3 client."""
+    if not S3_BUCKET_NAME or not S3_ACCESS_KEY_ID or not S3_SECRET_ACCESS_KEY:
+        return None
+    
+    config = {
+        "service_name": "s3",
+        "region_name": S3_REGION,
+        "aws_access_key_id": S3_ACCESS_KEY_ID,
+        "aws_secret_access_key": S3_SECRET_ACCESS_KEY,
+    }
+    
+    if S3_ENDPOINT_URL:
+        config["endpoint_url"] = S3_ENDPOINT_URL
+    
+    return boto3.client(**config)
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
 DEFAULT_MODEL_ID = os.getenv(
     "MODEL_ID",
-    "freudymind/FLUX.2-klein-base-9B"
+    "black-forest-labs/FLUX.2-klein-9B"
 )
 
 DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
@@ -194,8 +230,14 @@ INPUT_SCHEMA = {
     "output_format": {
         "type": str,
         "required": False,
-        "default": "png",
+        "default": "jpeg",
         "constraints": lambda x: x.lower() in ["png", "jpeg", "webp"],
+    },
+    "return_type": {
+        "type": str,
+        "required": False,
+        "default": "s3" if S3_BUCKET_NAME else "base64",
+        "constraints": lambda x: x.lower() in ["s3", "base64"],
     },
     "max_sequence_length": {
         "type": int,
@@ -210,13 +252,78 @@ INPUT_SCHEMA = {
 # Helper Functions
 # ============================================================================
 
-def encode_image_to_base64(image: Image.Image, format: str = "png") -> str:
+def encode_image_to_base64(image: Image.Image, format: str = "jpeg") -> str:
     """Encode a PIL Image to base64 string."""
     buffer = io.BytesIO()
     format_map = {"png": "PNG", "jpeg": "JPEG", "webp": "WebP"}
-    image.save(buffer, format=format_map.get(format.lower(), "PNG"))
+    # Use JPEG quality optimization for smaller payload
+    if format.lower() == "jpeg":
+        image.save(buffer, format="JPEG", quality=95, optimize=True)
+    else:
+        image.save(buffer, format=format_map.get(format.lower(), "PNG"))
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode("utf-8")
+
+
+def upload_to_s3(image: Image.Image, format: str = "jpeg") -> Optional[str]:
+    """
+    Upload image to S3 and return presigned URL.
+    
+    Args:
+        image: PIL Image to upload
+        format: Image format (jpeg, png, webp)
+    
+    Returns:
+        Presigned URL for the uploaded image or None if S3 is not configured
+    """
+    s3_client = get_s3_client()
+    if not s3_client:
+        return None
+    
+    # Generate unique filename
+    file_extension = format.lower()
+    if file_extension == "jpeg":
+        file_extension = "jpg"
+    filename = f"flux2-klein/{uuid.uuid4()}.{file_extension}"
+    
+    # Convert image to bytes
+    buffer = io.BytesIO()
+    if format.lower() == "jpeg":
+        image.save(buffer, format="JPEG", quality=95, optimize=True)
+        content_type = "image/jpeg"
+    elif format.lower() == "webp":
+        image.save(buffer, format="WebP", quality=95)
+        content_type = "image/webp"
+    else:
+        image.save(buffer, format="PNG")
+        content_type = "image/png"
+    
+    buffer.seek(0)
+    
+    try:
+        # Upload to S3
+        s3_client.upload_fileobj(
+            buffer,
+            S3_BUCKET_NAME,
+            filename,
+            ExtraArgs={
+                "ContentType": content_type,
+                "CacheControl": "max-age=31536000",  # 1 year cache
+            }
+        )
+        
+        # Generate presigned URL
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET_NAME, "Key": filename},
+            ExpiresIn=S3_PRESIGNED_URL_EXPIRY,
+        )
+        
+        return url
+    
+    except ClientError as e:
+        print(f"Error uploading to S3: {e}")
+        return None
 
 
 def load_lora_weights(
@@ -293,13 +400,18 @@ def initialize_pipeline(
     # Get torch dtype
     torch_dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Load the pipeline
-    pipeline = FluxPipeline.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        use_flash_attention_2=USE_FLASH_ATTN,
-        device_map="auto",
-    )
+    # Load the pipeline with HF token for gated models
+    load_kwargs = {
+        "torch_dtype": torch_dtype,
+        "use_flash_attention_2": USE_FLASH_ATTN,
+        "device_map": "auto",
+    }
+    
+    # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-9B)
+    if HF_TOKEN:
+        load_kwargs["token"] = HF_TOKEN
+    
+    pipeline = FluxPipeline.from_pretrained(model_id, **load_kwargs)
 
     # Load LoRA if specified
     if lora_path:
@@ -469,34 +581,75 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     generation_time = time.time() - start_time
 
     # Process output images
-    images_base64 = []
-    for img in result.images:
-        images_base64.append(encode_image_to_base64(img, output_format))
-
-    # Prepare response
-    response = {
-        "images": images_base64,
-        "format": output_format,
-        "parameters": {
-            "prompt": prompt,
-            "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": num_inference_steps,
-            "guidance_scale": guidance_scale,
-            "seed": seed,
-            "num_images": num_images,
-            "max_sequence_length": max_sequence_length,
-            "shift": shift,
-        },
-        "metadata": {
-            "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
-            "lora_path": current_lora_path if current_lora_path else None,
-            "lora_scale": current_lora_scale if current_lora_path else None,
-            "generation_time": f"{generation_time:.2f}s",
-            "preset": preset_name if preset_name else None,
+    return_type = job_input.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
+    
+    if return_type == "s3":
+        # Upload to S3 and return presigned URLs
+        image_urls = []
+        for img in result.images:
+            url = upload_to_s3(img, output_format)
+            if url:
+                image_urls.append(url)
+            else:
+                # Fallback to base64 if S3 upload fails
+                image_urls.append(encode_image_to_base64(img, output_format))
+        
+        response = {
+            "image_urls": image_urls,
+            "format": output_format,
+            "return_type": "s3",
+            "parameters": {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "width": width,
+                "height": height,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "seed": seed,
+                "num_images": num_images,
+                "max_sequence_length": max_sequence_length,
+                "shift": shift,
+            },
+            "metadata": {
+                "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
+                "lora_path": current_lora_path if current_lora_path else None,
+                "lora_scale": current_lora_scale if current_lora_path else None,
+                "generation_time": f"{generation_time:.2f}s",
+                "preset": preset_name if preset_name else None,
+                "s3_bucket": S3_BUCKET_NAME,
+                "presigned_url_expiry_seconds": S3_PRESIGNED_URL_EXPIRY,
+            }
         }
-    }
+    else:
+        # Return base64 encoded images
+        images_base64 = []
+        for img in result.images:
+            images_base64.append(encode_image_to_base64(img, output_format))
+        
+        response = {
+            "images": images_base64,
+            "format": output_format,
+            "return_type": "base64",
+            "parameters": {
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "width": width,
+                "height": height,
+                "num_inference_steps": num_inference_steps,
+                "guidance_scale": guidance_scale,
+                "seed": seed,
+                "num_images": num_images,
+                "max_sequence_length": max_sequence_length,
+                "shift": shift,
+            },
+            "metadata": {
+                "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
+                "lora_path": current_lora_path if current_lora_path else None,
+                "lora_scale": current_lora_scale if current_lora_path else None,
+                "generation_time": f"{generation_time:.2f}s",
+                "preset": preset_name if preset_name else None,
+            }
+        }
 
     return response
 
@@ -547,12 +700,14 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================
 
 if __name__ == "__main__":
-    print("Starting FLUX.2-klein-base-9B RunPod Serverless Worker...")
+    print("Starting FLUX.2-klein RunPod Serverless Worker...")
     print(f"Model ID: {DEFAULT_MODEL_ID}")
     print(f"Default LoRA Path: {DEFAULT_LORA_PATH if DEFAULT_LORA_PATH else 'None'}")
     print(f"Device: {DEVICE}")
     print(f"Dtype: {DTYPE}")
     print(f"Flash Attention: {USE_FLASH_ATTN}")
+    print(f"S3 Bucket: {S3_BUCKET_NAME if S3_BUCKET_NAME else 'Not configured'}")
+    print(f"HF Token: {'Configured' if HF_TOKEN else 'Not configured (required for gated models)'}")
 
     # Start the serverless worker
     runpod.serverless.start({"handler": handler})
