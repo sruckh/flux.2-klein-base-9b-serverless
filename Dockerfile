@@ -6,19 +6,15 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # Required on Ubuntu 24.04 (PEP 668) — safe inside a container
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     DEBIAN_FRONTEND=noninteractive \
-    # HuggingFace cache configuration for RunPod network volumes
     HF_HOME=/runpod-volume/huggingface \
     HF_HUB_CACHE=/runpod-volume/huggingface/hub \
     TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub \
-    # HuggingFace download performance optimizations
     HF_XET_HIGH_PERFORMANCE=1 \
     HF_XET_NUM_CONCURRENT_RANGE_GETS=32 \
     HF_HUB_ETAG_TIMEOUT=30 \
     HF_HUB_DOWNLOAD_TIMEOUT=300 \
-    # Disable progress bars for cleaner logs
     HF_HUB_DISABLE_PROGRESS_BARS=1
 
 # Install Python 3.12 and system dependencies
@@ -36,7 +32,7 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
 
 # Upgrade pip
-RUN python3 -m pip install --upgrade pip setuptools wheel
+RUN python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
 
 # Install PyTorch with CUDA 12.8 support
 RUN pip install --no-cache-dir \
