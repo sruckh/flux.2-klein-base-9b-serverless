@@ -13,10 +13,10 @@ codemap --diff --ref <branch> # Changes vs specific branch
 
 ## Project Overview
 
-This is a **RunPod Serverless** deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support. The implementation is based on [ai-toolkit](https://github.com/ostris/ai-toolkit) and uses flow matching with dynamic shift calculation matching training behavior.
+This is a **RunPod Serverless** deployment for FLUX.2-klein image generation with custom LoRA weight support. The implementation is based on [ai-toolkit](https://github.com/ostris/ai-toolkit) and uses flow matching with dynamic shift calculation matching training behavior.
 
 **Primary files:**
-- `handler.py` - Main serverless handler (FluxPipeline, presets, validation, generation)
+- `handler.py` - Main serverless handler (FluxPipeline, presets, validation, generation, S3 upload)
 - `Dockerfile` - Container definition (runpod/base, CUDA 12.8, PyTorch 2.8, Flash Attention 2.8.3)
 - `requirements.txt` - Python dependencies
 - `test_input.json` - Sample API request for testing
@@ -53,10 +53,10 @@ Configure template at: `console.runpod.io/serverless/user/templates`
 
 The `handler.py` follows this flow:
 
-1. **Configuration** (lines 32-116): Environment variables, dtype mapping, `PRESETS` dict
-2. **Validation** (lines 131-206): `INPUT_SCHEMA` with RunPod's `rp_validator`
-3. **Pipeline** (lines 273-329): Global `pipeline` instance with CPU offload, VAE optimizations
-4. **Generation** (lines 365-501): Preset application → parameter extraction → `FluxPipeline()` call → base64 encoding
+1. **Configuration** (lines 30-70): Environment variables, S3 config, dtype mapping, `PRESETS` dict
+2. **Validation** (lines 145-220): `INPUT_SCHEMA` with RunPod's `rp_validator`
+3. **Pipeline** (lines 325-385): Global `pipeline` instance with CPU offload, VAE optimizations
+4. **Generation** (lines 420-560): Preset application → parameter extraction → `FluxPipeline()` call → S3 upload or base64 encoding
 
 ### Key Implementation Details
 
@@ -82,6 +82,25 @@ The pipeline uses three optimizations for constrained GPU memory:
 pipeline.enable_model_cpu_offload()  # Offload model to CPU between forward passes
 pipeline.vae.enable_slicing()         # Process VAE in slices
 pipeline.vae.enable_tiling()          # Process VAE in tiles
+```
+
+### Model Caching (RunPod Network Volumes)
+
+Models cached to `/runpod-volume/huggingface` for persistence across worker restarts:
+```dockerfile
+HF_HOME=/runpod-volume/huggingface
+HF_HUB_CACHE=/runpod-volume/huggingface/hub
+TRANSFORMERS_CACHE=/runpod-volume/huggingface/hub
+```
+
+### High-Performance Downloads
+
+Xet storage backend optimizations:
+```dockerfile
+HF_XET_HIGH_PERFORMANCE=1              # Maximize network/disk usage
+HF_XET_NUM_CONCURRENT_RANGE_GETS=32    # 32 concurrent chunks (default: 16)
+HF_HUB_ETAG_TIMEOUT=30                 # 30s metadata timeout
+HF_HUB_DOWNLOAD_TIMEOUT=300            # 5min download timeout
 ```
 
 ## Optimized Settings Reference
