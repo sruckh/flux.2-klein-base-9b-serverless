@@ -5,44 +5,49 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8.0-orange)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-> A production-ready RunPod serverless deployment for FLUX.2-klein image generation with custom LoRA weight support.
+> A production-ready RunPod serverless deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support.
 
-This serverless API generates high-quality images using the **FLUX.2-klein** diffusion model with support for custom LoRA weights. It features optimized presets for ultra-realistic human character generation, flow matching inference, S3 storage with presigned URLs, and dynamic shift calculation that matches ai-toolkit training behavior.
+This serverless API generates high-quality images using the **FLUX.2-klein-base-9B** base model via `Flux2KleinPipeline`, with support for custom LoRA weights loaded from HTTPS URLs, HuggingFace Hub, or local paths. Output is delivered via S3 presigned URLs or base64.
+
+> **Important:** This uses the **base (undistilled)** model. Use 25–50 inference steps and guidance scale 3.5–5.0. Do not use 4–8 steps or guidance 1.0 — those settings are for the distilled variant.
 
 ## ✨ Features
 
-- **FLUX.2-klein** - State-of-the-art diffusion model by Black Forest Labs
-- **Custom LoRA Support** - Load LoRA weights from HuggingFace, local files, or direct HTTPS URLs
-- **Flash Attention 2** - Memory-efficient attention for faster inference
-- **Dynamic Shift Calculation** - Matches training behavior for optimal results
-- **Optimized Presets** - Research-backed settings for realistic characters, portraits, and more
-- **Flexible Generation** - Configurable resolution, steps, guidance scale, and batch size
+- **FLUX.2-klein-base-9B** - Undistilled 9B-parameter flow-match transformer by Black Forest Labs
+- **Flux2KleinPipeline** - Correct pipeline class via git diffusers (not available in stable releases)
+- **Custom LoRA Support** - Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
+- **LoRA Hot-Swap** - Switch LoRA between requests without reloading the base model
+- **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 3.0)
+- **Optimized Presets** - BFL-aligned settings for realistic characters, portraits, and more
+- **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **Multiple Output Formats** - PNG, JPEG, WebP support
-- **S3 Storage** - Upload images to S3 with presigned URLs (no more base64 size limits!)
-- **RunPod Model Cache** - Optimized HuggingFace cache on network volumes
-- **High-Performance Downloads** - Xet storage backend with concurrent downloads
+- **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
+- **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts
+- **High-Performance Downloads** - Xet storage backend with concurrent chunk downloads
 
 ## 🏗️ Architecture
 
 ![Data Flow Diagram](./docs/diagrams/data-flow.svg)
 
-The system follows a modular architecture where RunPod Serverless receives API requests and routes them through the handler pipeline. The FluxPipeline manages model inference with VAE slicing/tiling optimizations while supporting dynamic LoRA weight loading from HuggingFace Hub, local storage, or direct HTTPS URLs.
+The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization.
 
 ### Data Flow Pipeline
 
-1. **Input Validation** - Request parameters validated against schema, preset defaults applied
-2. **Pipeline Init** - FLUX.2 model loaded with optional LoRA weights, memory optimizations enabled
-3. **Parameter Processing** - Preset values applied, dynamic shift calculated based on resolution
-4. **Image Generation** - Flow matching scheduler generates images via FluxPipeline
-5. **Post-Processing** - Images uploaded to S3 (presigned URL) or encoded to base64, JSON response with metadata built
+1. **Input Validation** — Parameters validated against schema, preset defaults applied
+2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + `.to("cuda")`; scheduler initialized with `shift=3.0`; VAE slicing/tiling enabled
+3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
+4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
+5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
+6. **Post-Processing** — Images uploaded to S3 (presigned URL) or encoded to base64
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
 - **Docker** - For containerized deployment
-- **RunPod Account** - For serverless GPU deployment (free tier available)
-- **NVIDIA GPU** - At least 16GB VRAM for local testing (H100/A100 recommended for production)
+- **RunPod Account** - For serverless GPU deployment
+- **NVIDIA GPU** - H100 or A100 80GB recommended (model needs ~22–24 GB VRAM at BF16)
+- **HuggingFace Token** - Required (FLUX.2-klein-base-9B is a gated model)
 
 ### Installation
 
@@ -55,9 +60,9 @@ cd flux.2-klein-serverless
 docker build -t flux-2-klein-serverless .
 
 # Run locally (GPU required)
-# Note: Set HF_TOKEN if the model is gated on HuggingFace
 docker run --gpus all -p 8000:8000 \
   -e HF_TOKEN=your_huggingface_token \
+  -e S3_BUCKET_NAME=your-bucket \
   flux-2-klein-serverless
 
 # Test the endpoint
@@ -87,42 +92,59 @@ git push -u origin main
 
 3. **Set Environment Variables** (see Configuration section below)
 
-4. **Deploy** - RunPod automatically builds and deploys. Future pushes trigger redeployment.
+4. **Deploy** — RunPod automatically builds and deploys. Future pushes trigger redeployment.
 
 ## 📖 Documentation
 
 ### Optimized Presets
 
-Research-backed presets from Black Forest Labs documentation, fal.ai guides, and community testing:
+Presets aligned with BFL documentation for the base (undistilled) model:
 
-| Preset | Steps | Guidance | Resolution | Best For |
-|--------|-------|----------|------------|----------|
-| `realistic_character` | 28 | 2.5 | 1024×1024 | **Ultra-realistic human LoRAs** (default) |
-| `portrait_hd` | 30 | 3.0 | 1024×1536 | High-detail vertical portraits |
-| `cinematic_full` | 28 | 3.5 | 1536×1024 | Full-body cinematic compositions |
-| `fast_preview` | 15 | 3.0 | 1024×1024 | Quick prompt testing |
-| `maximum_quality` | 50 | 3.5 | 1024×1024 | Highest quality final output |
+| Preset | Steps | Guidance | Resolution | Shift | Best For |
+|--------|-------|----------|------------|-------|----------|
+| `realistic_character` | 30 | 4.0 | 1024×1024 | 3.0 | **Ultra-realistic human LoRAs** (default) |
+| `portrait_hd` | 30 | 4.0 | 1024×1536 | 3.0 | High-detail vertical portraits |
+| `cinematic_full` | 30 | 4.5 | 1536×1024 | 3.0 | Full-body cinematic compositions |
+| `fast_preview` | 25 | 3.5 | 1024×1024 | 3.0 | Quick prompt testing |
+| `maximum_quality` | 50 | 5.0 | 1024×1024 | 3.0 | Highest quality final output |
 
 ### Realistic Character Best Practices
 
+> **This is the base (undistilled) model.** Do not use distilled model settings.
+
 **Optimal Inference Settings:**
-- **Steps:** 28-30 (BFL recommends 20-30 for photorealistic styles)
-- **Guidance:** 2.5-3.5 (lower = more natural appearance)
-- **Resolution:** 1024×1024 standard, 1024×1536 for portraits
-- **LoRA Scale:** 0.8-1.2 for character weights
+- **Steps:** 25–50 (sweet spot: 28–30 for quality/speed balance)
+- **Guidance:** 3.5–5.0 — BFL default is 4.0; match your AI-Toolkit training YAML `sample.guidance`
+- **Scheduler Shift:** 3.0 for character LoRAs; tune 1.0–7.0 (higher = better large-structure coherence)
+- **Resolution:** 1024×1024 standard, 1024×1536 for portraits (match your training preview size)
+- **LoRA Scale:** 0.7–1.0 — start from your training YAML `sample.lora_weight` (typically 0.85); avoid >1.0
+
+**Trigger Word:** Include your LoRA trigger word first in the prompt (AI-Toolkit convention).
 
 **Prompt Structure:**
 ```
-[Subject] + [Action/Pose] + [Camera/Lens] + [Lighting] + [Style/Mood]
+[TRIGGER] [subject description], [clothing/environment], [lighting], [camera/lens], photorealistic
 ```
 
 Example:
 ```
-A professional portrait photograph of TOK, a young woman with shoulder-length
-auburn hair, wearing a casual white blouse, soft natural lighting from window,
-shot on Sony A7IV, 85mm lens, f/1.8, shallow depth of field, photorealistic,
-highly detailed skin texture
+TOK woman, close-up portrait, soft window light from the left, slight smile,
+out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photorealistic
 ```
+
+**Prompting Notes:**
+- FLUX.2-klein uses Qwen3-8B as text encoder — it handles long, descriptive prompts well
+- Avoid SDXL boilerplate ("masterpiece, best quality") — this is a flow transformer, not SD1.5
+- Leave `negative_prompt` empty or use it sparingly — base model has limited negative prompt support
+
+### Scheduler Shift Reference
+
+| Shift | Effect |
+|-------|--------|
+| `1.0` | Linear default; flat noise distribution |
+| `3.0` | **Recommended for character LoRAs**; better face/skin coherence |
+| `5.0` | More time at high-noise timesteps; helps complex lighting |
+| `7.0` | Maximum structure emphasis; useful for multi-figure scenes |
 
 ### API Reference
 
@@ -130,10 +152,12 @@ highly detailed skin texture
 ```json
 {
   "input": {
-    "prompt": "a professional portrait photograph of TOK, shot on Sony A7IV, 85mm, photorealistic",
+    "prompt": "TOK woman, close-up portrait, soft window light, Sony A7IV, 105mm f/2.8, photorealistic",
     "preset": "realistic_character",
-    "lora_path": "https://example.com/your-lora.safetensors",
-    "lora_scale": 1.0,
+    "lora_path": "https://example.com/your-character-lora.safetensors",
+    "lora_scale": 0.85,
+    "guidance_scale": 4.0,
+    "shift": 3.0,
     "seed": 42,
     "return_type": "s3"
   }
@@ -146,7 +170,7 @@ highly detailed skin texture
   "image_urls": ["https://s3.amazonaws.com/bucket/flux2-klein/uuid.jpg?X-Amz-Algorithm=..."],
   "format": "jpeg",
   "return_type": "s3",
-  "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
+  "parameters": { "width": 1024, "height": 1024, "num_inference_steps": 30, "guidance_scale": 4.0, "shift": 3.0, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
@@ -163,7 +187,7 @@ highly detailed skin texture
   "images": ["<base64_encoded_image>"],
   "format": "jpeg",
   "return_type": "base64",
-  "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
+  "parameters": { "width": 1024, "height": 1024, "num_inference_steps": 30, "guidance_scale": 4.0, "shift": 3.0, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
@@ -176,32 +200,32 @@ highly detailed skin texture
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | *required* | Text prompt for image generation |
-| `preset` | string | `realistic_character` | Quality preset |
-| `negative_prompt` | string | `""` | Negative prompt for unwanted elements |
+| `prompt` | string | *required* | Text prompt — include trigger word first |
+| `preset` | string | `realistic_character` | Quality preset (see table above) |
+| `negative_prompt` | string | `""` | Negative prompt (limited effect on base model) |
 | `width` | int | `1024` | Image width (multiple of 16) |
 | `height` | int | `1024` | Image height (multiple of 16) |
-| `num_inference_steps` | int | `28` | Denoising steps (1-100) |
-| `guidance_scale` | float | `2.5` | CFG scale (lower = more realistic) |
+| `num_inference_steps` | int | `30` | Denoising steps — use 25–50 for base model |
+| `guidance_scale` | float | `4.0` | CFG scale — use 3.5–5.0; match training YAML `sample.guidance` |
+| `shift` | float | `3.0` | Scheduler shift — 3.0 for character LoRAs; tune 1.0–7.0 |
 | `seed` | int | `-1` | Random seed (-1 for random) |
-| `num_images` | int | `1` | Number of images (1-4) |
-| `output_format` | string | `"jpeg"` | Output format: png, jpeg, webp |
+| `num_images` | int | `1` | Number of images per request (1–4) |
+| `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
-| `max_sequence_length` | int | `512` | Max text encoder sequence length |
+| `max_sequence_length` | int | `512` | Text encoder max sequence length |
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
-| `lora_scale` | float | `1.0` | LoRA weight scale (0.0-2.0) |
+| `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); match training YAML `sample.lora_weight` |
 
 ### Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9B` | BF16 diffusers pipeline (Flux2KleinPipeline) |
-| `DEFAULT_LORA_PATH` | `""` | Default LoRA to load |
-| `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA scale |
-| `DEVICE` | `cuda` | Device to run on |
-| `DTYPE` | `bf16` | Data type: `bf16`, `float16`, `float32`, `float8`/`float8_e4m3fn` (H100 only) |
-| `USE_FLASH_ATTN` | `true` | Enable Flash Attention 2 |
-| `HF_TOKEN` | `""` | HuggingFace token — required if model repo is gated |
+| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9B` | Base model (loaded via `Flux2KleinPipeline`) |
+| `DEFAULT_LORA_PATH` | `""` | Default LoRA loaded at worker startup |
+| `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA weight scale |
+| `DEVICE` | `cuda` | Compute device |
+| `DTYPE` | `bf16` | Compute dtype: `bf16`, `float16`, `float32` |
+| `HF_TOKEN` | `""` | **Required** — FLUX.2-klein-base-9B is a gated model |
 
 ### S3 Configuration (Optional)
 
@@ -214,6 +238,8 @@ highly detailed skin texture
 | `S3_ENDPOINT_URL` | `""` | Custom S3 endpoint (e.g., MinIO, Wasabi) |
 | `S3_PRESIGNED_URL_EXPIRY` | `3600` | Presigned URL expiry in seconds |
 
+**Note:** When `S3_BUCKET_NAME` is configured, images are uploaded to S3 and a presigned URL is returned instead of base64. This avoids payload size limits and improves response times.
+
 ### HuggingFace Performance Tuning
 
 | Environment Variable | Default | Description |
@@ -222,10 +248,17 @@ highly detailed skin texture
 | `HF_HUB_CACHE` | `/runpod-volume/huggingface/hub` | Model cache directory |
 | `HF_XET_HIGH_PERFORMANCE` | `1` | Enable high-performance Xet downloads |
 | `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` | Concurrent download chunks |
-| `HF_HUB_ETAG_TIMEOUT` | `30` | Timeout for metadata requests |
-| `HF_HUB_DOWNLOAD_TIMEOUT` | `300` | Timeout for file downloads |
+| `HF_HUB_ETAG_TIMEOUT` | `30` | Timeout for metadata requests (seconds) |
+| `HF_HUB_DOWNLOAD_TIMEOUT` | `300` | Timeout for file downloads (seconds) |
 
-**Note:** When `S3_BUCKET_NAME` is configured, images are uploaded to S3 and a presigned URL is returned instead of base64. This avoids payload size limits and improves response times.
+### VRAM Requirements
+
+| Configuration | VRAM | Notes |
+|---------------|------|-------|
+| BF16, no offload | ~22–24 GB | Best quality; H100/A100 80GB |
+| BF16 + CPU offload | ~12–14 GB | Slower; 3090/4080 |
+
+This deployment targets H100/A100 80GB with full VRAM placement (no CPU offload).
 
 ## 🎨 Training Custom LoRAs
 
@@ -243,7 +276,9 @@ python flux_train_ui.py
 - **Steps:** 7000 (BFL recommendation for photorealistic)
 - **Learning Rate:** 0.000095
 - **Weight Decay:** 0.00001
-- **Dataset:** 20-40 images with diverse angles/expressions/lighting
+- **Dataset:** 20–40 images with diverse angles, expressions, and lighting
+
+**Training → Inference Alignment:** Set `guidance_scale`, `num_inference_steps`, and `lora_scale` to match your AI-Toolkit training YAML's `sample.guidance`, `sample.sample_steps`, and `sample.lora_weight` respectively. Mismatching these is the most common cause of inference not matching training previews.
 
 ## 📄 License
 
@@ -252,7 +287,7 @@ This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-
 ## 🙏 Acknowledgments
 
 - **[ai-toolkit](https://github.com/ostris/ai-toolkit)** by ostris - Training framework and reference implementation
-- **[FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)** by Black Forest Labs - Base model
+- **[FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)** by Black Forest Labs - Base model
 - **[RunPod](https://runpod.io)** - Serverless GPU infrastructure
 
 ## 📧 Support
