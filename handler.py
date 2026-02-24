@@ -79,6 +79,19 @@ DEVICE = os.getenv("DEVICE", "cuda")
 DTYPE = os.getenv("DTYPE", "bf16").lower()
 USE_FLASH_ATTN = os.getenv("USE_FLASH_ATTN", "true").lower() == "true"
 
+# FP8 transformer repo (single-file safetensors, transformer weights only).
+# Used when DTYPE=float8_e4m3fn to swap the bf16 transformer for an fp8 one,
+# saving ~9 GB VRAM (18 GB bf16 → 9 GB fp8) while keeping text encoders at bf16.
+FP8_TRANSFORMER_ID = os.getenv(
+    "FP8_TRANSFORMER_ID",
+    "black-forest-labs/FLUX.2-klein-base-9b-fp8",
+)
+
+# When True, use enable_model_cpu_offload() instead of pipeline.to(DEVICE).
+# Recommended for GPUs with ≤ 24 GB VRAM (e.g. RTX 4090): peak VRAM drops to
+# ~11 GB (largest single component) at the cost of slower CPU↔GPU transfers.
+ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "false").lower() == "true"
+
 # Map dtype string to torch dtype
 DTYPE_MAP = {
     "bf16": torch.bfloat16,
@@ -406,18 +419,51 @@ def initialize_pipeline(
     Returns:
         Initialized Flux2KleinPipeline
     """
+    import gc
+
     global model_loaded
 
     print(f"Initializing Flux2Klein pipeline with model: {model_id}")
 
     dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    load_kwargs = {"torch_dtype": dtype}
+    # Load the full pipeline at bf16.  When fp8 is requested we swap in the
+    # fp8 transformer below; keeping text encoders at bf16 preserves quality.
+    pipeline_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+
+    load_kwargs = {"torch_dtype": pipeline_dtype}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
-    pipeline = pipeline.to(DEVICE)
+
+    # Swap in fp8 transformer when DTYPE=float8_e4m3fn.
+    # Saves ~9 GB VRAM: bf16 transformer (~18 GB) → fp8 (~9 GB).
+    # The fp8 repo contains a single-file safetensors (transformer only).
+    if dtype == torch.float8_e4m3fn and FP8_TRANSFORMER_ID:
+        print(f"Swapping in fp8 transformer from: {FP8_TRANSFORMER_ID}")
+        transformer_class = type(pipeline.transformer)
+        # Release bf16 transformer from CPU RAM before loading fp8 weights.
+        pipeline.transformer = None
+        gc.collect()
+        fp8_kwargs = {"torch_dtype": torch.float8_e4m3fn}
+        if HF_TOKEN:
+            fp8_kwargs["token"] = HF_TOKEN
+        pipeline.transformer = transformer_class.from_single_file(
+            FP8_TRANSFORMER_ID, **fp8_kwargs
+        )
+        print("fp8 transformer loaded")
+
+    # Device placement — two modes:
+    #   pipeline.to(DEVICE)          : all components on GPU simultaneously
+    #   enable_model_cpu_offload()   : components move GPU→CPU after each use;
+    #                                  peak VRAM = largest single component (~9 GB)
+    #                                  recommended for ≤ 24 GB GPUs (e.g. RTX 4090)
+    if ENABLE_CPU_OFFLOAD:
+        print("Using model CPU offload (peak VRAM ~9 GB)")
+        pipeline.enable_model_cpu_offload()
+    else:
+        pipeline = pipeline.to(DEVICE)
 
     # Set scheduler with shift=3.0 (recommended for character LoRAs by BFL).
     # FlowMatchEulerDiscreteScheduler is the native scheduler for FLUX.2 Klein.
