@@ -148,7 +148,7 @@ highly detailed skin texture
   "return_type": "s3",
   "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-base-9b-fp8",
+    "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
     "preset": "realistic_character",
     "s3_bucket": "your-bucket-name",
@@ -165,7 +165,7 @@ highly detailed skin texture
   "return_type": "base64",
   "parameters": { "width": 1024, "height": 1024, "seed": 42, ... },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-base-9b-fp8",
+    "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
     "preset": "realistic_character"
   }
@@ -195,7 +195,7 @@ highly detailed skin texture
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9b-fp8` | Base model |
+| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9B` | BF16 diffusers pipeline (Flux2KleinPipeline) |
 | `DEFAULT_LORA_PATH` | `""` | Default LoRA to load |
 | `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA scale |
 | `DEVICE` | `cuda` | Device to run on |
@@ -247,16 +247,16 @@ python flux_train_ui.py
 
 ## 📄 License
 
-This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-base-9B model has its own license terms — refer to the [HuggingFace model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8).
+This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-base-9B model has its own license terms — refer to the [HuggingFace model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B).
 
 ## 🙏 Acknowledgments
 
 - **[ai-toolkit](https://github.com/ostris/ai-toolkit)** by ostris - Training framework and reference implementation
-- **[FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8)** by Black Forest Labs - Base model
+- **[FLUX.2-klein-base-9b-fp8](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)** by Black Forest Labs - Base model
 - **[RunPod](https://runpod.io)** - Serverless GPU infrastructure
 
 ## 📧 Support
 
 - **This deployment:** Check logs in RunPod console
-- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8)
+- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)
 - **Training:** See [ai-toolkit issues](https://github.com/ostris/ai-toolkit/issues)

@@ -20,13 +20,9 @@ from typing import Dict, Any, List, Optional, Union
 import boto3
 import torch
 from botocore.exceptions import ClientError
-from diffusers import FluxPipeline
-try:
-    from diffusers.pipelines.flux.pipeline_output import FluxPipelineOutput
-except ImportError:
-    from diffusers.pipelines.flux.pipeline_flux_output import FluxPipelineOutput
+from diffusers import Flux2KleinPipeline
 from PIL import Image
-from safetensors.torch import load_file
+
 
 # RunPod serverless SDK
 import runpod
@@ -72,7 +68,7 @@ def get_s3_client():
 
 DEFAULT_MODEL_ID = os.getenv(
     "MODEL_ID",
-    "black-forest-labs/FLUX.2-klein-base-9b-fp8"
+    "black-forest-labs/FLUX.2-klein-base-9B"
 )
 
 DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
@@ -164,7 +160,7 @@ PRESETS = {
 # Global Pipeline Instance
 # ============================================================================
 
-pipeline: Optional[FluxPipeline] = None
+pipeline: Optional[Flux2KleinPipeline] = None
 model_loaded = False
 lora_path_loaded: str = DEFAULT_LORA_PATH
 
@@ -336,15 +332,15 @@ def upload_to_s3(image: Image.Image, format: str = "jpeg") -> Optional[str]:
 
 
 def load_lora_weights(
-    pipeline: FluxPipeline,
+    pipeline: Flux2KleinPipeline,
     lora_path: str,
     lora_scale: float = 1.0
-) -> FluxPipeline:
+) -> Flux2KleinPipeline:
     """
     Load LoRA weights onto the pipeline.
 
     Args:
-        pipeline: The FLUX pipeline
+        pipeline: The Flux2Klein pipeline
         lora_path: Path, HuggingFace repo ID, or HTTPS URL for LoRA weights
         lora_scale: Scaling factor for LoRA weights (0.0 to 2.0)
 
@@ -395,9 +391,9 @@ def initialize_pipeline(
     model_id: str = DEFAULT_MODEL_ID,
     lora_path: str = "",
     lora_scale: float = DEFAULT_LORA_SCALE,
-) -> FluxPipeline:
+) -> Flux2KleinPipeline:
     """
-    Initialize the FLUX.2 pipeline with optional LoRA weights.
+    Initialize the Flux2Klein pipeline with optional LoRA weights.
 
     Args:
         model_id: HuggingFace model ID or local path
@@ -405,11 +401,11 @@ def initialize_pipeline(
         lora_scale: LoRA weight scaling factor
 
     Returns:
-        Initialized FluxPipeline
+        Initialized Flux2KleinPipeline
     """
     global model_loaded
 
-    print(f"Initializing FLUX pipeline with model: {model_id}")
+    print(f"Initializing Flux2Klein pipeline with model: {model_id}")
 
     # Get torch dtype
     torch_dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
@@ -420,11 +416,11 @@ def initialize_pipeline(
         "attn_implementation": "flash_attention_2" if USE_FLASH_ATTN else "eager",
     }
 
-    # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-9B)
+    # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-base-9B)
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
-    pipeline = FluxPipeline.from_pretrained(model_id, **load_kwargs)
+    pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
     # Move model fully onto the target device for optimal inference performance.
     # device_map="auto" and enable_model_cpu_offload() are mutually exclusive;
@@ -584,7 +580,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     start_time = time.time()
 
     with torch.inference_mode():
-        result: FluxPipelineOutput = pipeline(
+        result = pipeline(
             prompt=prompt,
             negative_prompt=negative_prompt if negative_prompt else None,
             width=width,
