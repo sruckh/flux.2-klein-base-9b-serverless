@@ -20,7 +20,8 @@ from typing import Dict, Any, List, Optional, Union
 import boto3
 import torch
 from botocore.exceptions import ClientError
-from diffusers import Flux2Pipeline
+from diffusers import Flux2KleinPipeline
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from PIL import Image
 
 
@@ -98,12 +99,12 @@ DTYPE_MAP = {
 # ============================================================================
 
 PRESETS = {
-    # Ultra-realistic human character/portrait LoRA
-    # Optimized for trained character LoRAs to achieve maximum photorealism
-    # Based on BFL recommendation: 20-30 steps for photorealistic styles
+    # Ultra-realistic human character/portrait LoRA.
+    # Base model (undistilled): use 25-50 steps, guidance 3.5-5.0.
+    # DO NOT use low step counts (4-8) — that is for distilled variants only.
     "realistic_character": {
-        "num_inference_steps": 28,
-        "guidance_scale": 2.5,
+        "num_inference_steps": 30,
+        "guidance_scale": 4.0,
         "width": 1024,
         "height": 1024,
         "max_sequence_length": 512,
@@ -111,10 +112,9 @@ PRESETS = {
     },
 
     # High-quality portrait with enhanced detail
-    # More steps for finer skin texture and detail
     "portrait_hd": {
         "num_inference_steps": 30,
-        "guidance_scale": 3.0,
+        "guidance_scale": 4.0,
         "width": 1024,
         "height": 1536,  # 2:3 portrait ratio
         "max_sequence_length": 512,
@@ -122,21 +122,19 @@ PRESETS = {
     },
 
     # Cinematic full-body character shot
-    # Wider aspect ratio for full-body compositions
     "cinematic_full": {
-        "num_inference_steps": 28,
-        "guidance_scale": 3.5,
+        "num_inference_steps": 30,
+        "guidance_scale": 4.5,
         "width": 1536,
         "height": 1024,  # 3:2 cinematic ratio
         "max_sequence_length": 512,
         "description": "Cinematic full-body character composition"
     },
 
-    # Fast iteration for testing
-    # Lower steps for quick generation during prompt development
+    # Fast iteration for prompt testing
     "fast_preview": {
-        "num_inference_steps": 15,
-        "guidance_scale": 3.0,
+        "num_inference_steps": 25,
+        "guidance_scale": 3.5,
         "width": 1024,
         "height": 1024,
         "max_sequence_length": 512,
@@ -144,10 +142,9 @@ PRESETS = {
     },
 
     # Maximum quality for final output
-    # Higher steps for best possible image quality
     "maximum_quality": {
         "num_inference_steps": 50,
-        "guidance_scale": 3.5,
+        "guidance_scale": 5.0,
         "width": 1024,
         "height": 1024,
         "max_sequence_length": 512,
@@ -160,7 +157,7 @@ PRESETS = {
 # Global Pipeline Instance
 # ============================================================================
 
-pipeline: Optional[Flux2Pipeline] = None
+pipeline: Optional[Flux2KleinPipeline] = None
 model_loaded = False
 lora_path_loaded: str = DEFAULT_LORA_PATH
 
@@ -207,7 +204,7 @@ INPUT_SCHEMA = {
     "guidance_scale": {
         "type": float,
         "required": False,
-        "default": 2.5,
+        "default": 4.0,  # BFL default for base (undistilled) model; range 3.5-5.0
         "constraints": lambda x: x >= 0,
     },
     "seed": {
@@ -249,6 +246,12 @@ INPUT_SCHEMA = {
         "required": False,
         "default": 512,
         "constraints": lambda x: x > 0,
+    },
+    "shift": {
+        "type": float,
+        "required": False,
+        "default": 3.0,  # BFL recommendation: 3.0 for character LoRAs; tune 1.0-7.0
+        "constraints": lambda x: 0.1 <= x <= 10.0,
     },
 }
 
@@ -332,10 +335,10 @@ def upload_to_s3(image: Image.Image, format: str = "jpeg") -> Optional[str]:
 
 
 def load_lora_weights(
-    pipeline: Flux2Pipeline,
+    pipeline: Flux2KleinPipeline,
     lora_path: str,
     lora_scale: float = 1.0
-) -> Flux2Pipeline:
+) -> Flux2KleinPipeline:
     """
     Load LoRA weights onto the pipeline.
 
@@ -391,7 +394,7 @@ def initialize_pipeline(
     model_id: str = DEFAULT_MODEL_ID,
     lora_path: str = "",
     lora_scale: float = DEFAULT_LORA_SCALE,
-) -> Flux2Pipeline:
+) -> Flux2KleinPipeline:
     """
     Initialize the Flux2Klein pipeline with optional LoRA weights.
 
@@ -401,32 +404,31 @@ def initialize_pipeline(
         lora_scale: LoRA weight scaling factor
 
     Returns:
-        Initialized Flux2Pipeline
+        Initialized Flux2KleinPipeline
     """
     global model_loaded
 
     print(f"Initializing Flux2Klein pipeline with model: {model_id}")
 
-    # Get torch dtype
-    torch_dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
+    dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Use device_map="balanced" so accelerate materialises meta tensors onto the
-    # GPU during loading. This is required for FLUX models which use accelerate
-    # internally and cannot be moved with .to() after the fact.
-    # device_map and enable_model_cpu_offload() are mutually exclusive — we use
-    # device_map for full VRAM placement (H100/A100 80 GB fits the 9B model).
-    load_kwargs = {
-        "torch_dtype": torch_dtype,
-        "device_map": "balanced",
-    }
-
-    # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-base-9B)
+    load_kwargs = {"torch_dtype": dtype}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
-    pipeline = Flux2Pipeline.from_pretrained(model_id, **load_kwargs)
+    pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
+    pipeline = pipeline.to(DEVICE)
 
-    # VAE memory optimizations — compatible with device_map
+    # Set scheduler with shift=3.0 (recommended for character LoRAs by BFL).
+    # FlowMatchEulerDiscreteScheduler is the native scheduler for FLUX.2 Klein.
+    # shift=3.0 biases the noise schedule toward high-noise timesteps, improving
+    # face/skin coherence and large structure quality.
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipeline.scheduler.config,
+        shift=3.0,
+    )
+
+    # VAE memory optimizations
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
 
@@ -440,10 +442,9 @@ def initialize_pipeline(
         _ = pipeline(
             prompt="warmup",
             num_inference_steps=1,
-            guidance_scale=1.0,
+            guidance_scale=4.0,
             width=512,
             height=512,
-            max_sequence_length=256,
         )
         print("Pipeline warmup complete")
     except Exception as e:
@@ -451,35 +452,6 @@ def initialize_pipeline(
 
     model_loaded = True
     return pipeline
-
-
-def calculate_shift(
-    image_seq_len: int,
-    base_seq_len: int = 256,
-    max_seq_len: int = 4096,
-    base_shift: float = 0.5,
-    max_shift: float = 1.16,
-) -> float:
-    """
-    Calculate dynamic shift for FLUX flow matching scheduler.
-
-    This matches the dynamic shifting used in FLUX models during training
-    as implemented in ai-toolkit.
-
-    Args:
-        image_seq_len: Length of the image sequence (h * w / patch_size^2)
-        base_seq_len: Base sequence length (default 256)
-        max_seq_len: Maximum sequence length (default 4096)
-        base_shift: Base shift value (default 0.5)
-        max_shift: Maximum shift value (default 1.16)
-
-    Returns:
-        Calculated shift value
-    """
-    m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
-    b = base_shift - m * base_seq_len
-    mu = image_seq_len * m + b
-    return mu
 
 
 # ============================================================================
@@ -561,19 +533,17 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         seed = int(time.time() * 1000) % (2**31)
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # Calculate dynamic shift based on image size
-    # FLUX uses patch_size = 2, so effective seq_len = (h/2) * (w/2)
-    h_patches = height // 2
-    w_patches = width // 2
-    image_seq_len = h_patches * w_patches
-
-    shift = calculate_shift(image_seq_len)
-
-    # Apply dynamic shift to the scheduler for this resolution
-    pipeline.scheduler.config.shift = shift
+    # Apply scheduler shift per request. shift=3.0 is the BFL-recommended default
+    # for character LoRAs. Users can tune 1.0–7.0: higher = more time at high-noise
+    # levels = better large-structure coherence.
+    shift = job_input.get("shift", 3.0)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipeline.scheduler.config,
+        shift=shift,
+    )
 
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-          f"guidance={guidance_scale}, shift={shift:.4f}")
+          f"guidance={guidance_scale}, shift={shift}")
 
     # Generate images
     start_time = time.time()
@@ -720,7 +690,7 @@ if __name__ == "__main__":
     print(f"Default LoRA Path: {DEFAULT_LORA_PATH if DEFAULT_LORA_PATH else 'None'}")
     print(f"Device: {DEVICE}")
     print(f"Dtype: {DTYPE}")
-    print(f"Flash Attention: {USE_FLASH_ATTN} (note: not supported by Flux2Pipeline attn kwarg)")
+    print(f"Flash Attention: {USE_FLASH_ATTN} (note: not supported by Flux2KleinPipeline attn kwarg)")
     print(f"S3 Bucket: {S3_BUCKET_NAME if S3_BUCKET_NAME else 'Not configured'}")
     print(f"HF Token: {'Configured' if HF_TOKEN else 'Not configured (required for gated models)'}")
 
