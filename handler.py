@@ -79,18 +79,6 @@ DEVICE = os.getenv("DEVICE", "cuda")
 DTYPE = os.getenv("DTYPE", "bf16").lower()
 USE_FLASH_ATTN = os.getenv("USE_FLASH_ATTN", "true").lower() == "true"
 
-# FP8 transformer: single .safetensors file (no model_index.json in that repo).
-# Loaded via hf_hub_download + from_single_file when DTYPE=float8_e4m3fn.
-# Saves ~9 GB VRAM: bf16 transformer (~18 GB) → fp8 (~9 GB).
-FP8_TRANSFORMER_ID = os.getenv(
-    "FP8_TRANSFORMER_ID",
-    "black-forest-labs/FLUX.2-klein-base-9b-fp8",
-)
-FP8_TRANSFORMER_FILENAME = os.getenv(
-    "FP8_TRANSFORMER_FILENAME",
-    "flux-2-klein-base-9b-fp8.safetensors",
-)
-
 # When True, use enable_model_cpu_offload() instead of pipeline.to(DEVICE).
 # Default True — peak VRAM = largest single component (~12-14 GB bf16, ~9 GB fp8).
 # Fits RTX 4090 (24 GB) and 32-80 GB GPUs alike.
@@ -421,49 +409,26 @@ def initialize_pipeline(
     Returns:
         Initialized Flux2KleinPipeline
     """
-    import gc
-    from huggingface_hub import hf_hub_download
-
     global model_loaded
 
     print(f"Initializing Flux2Klein pipeline with model: {model_id}")
 
     dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Always load the full pipeline at bf16. When fp8 is requested we swap in
-    # the fp8 transformer below; text encoders stay at bf16 for quality.
-    pipeline_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-
-    load_kwargs = {"torch_dtype": pipeline_dtype}
+    load_kwargs = {"torch_dtype": dtype}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
-    # Swap in fp8 transformer when DTYPE=float8_e4m3fn.
-    # The fp8 repo has a single .safetensors file (no model_index.json), so we
-    # download it via hf_hub_download (respects HF_HUB_CACHE) then from_single_file.
-    if dtype == torch.float8_e4m3fn and FP8_TRANSFORMER_ID:
-        print(f"Downloading fp8 transformer: {FP8_TRANSFORMER_ID}/{FP8_TRANSFORMER_FILENAME}")
-        dl_kwargs = {"repo_id": FP8_TRANSFORMER_ID, "filename": FP8_TRANSFORMER_FILENAME}
-        if HF_TOKEN:
-            dl_kwargs["token"] = HF_TOKEN
-        fp8_path = hf_hub_download(**dl_kwargs)
-        transformer_class = type(pipeline.transformer)
-        pipeline.transformer = None  # free bf16 transformer before loading fp8
-        gc.collect()
-        pipeline.transformer = transformer_class.from_single_file(
-            fp8_path, torch_dtype=torch.float8_e4m3fn
-        )
-        print("fp8 transformer loaded")
-
     # Device placement — two modes:
-    #   pipeline.to(DEVICE)          : all components on GPU simultaneously
-    #   enable_model_cpu_offload()   : components move GPU→CPU after each use;
-    #                                  peak VRAM = largest single component (~9 GB)
-    #                                  recommended for ≤ 24 GB GPUs (e.g. RTX 4090)
+    #   enable_model_cpu_offload() (default): components move GPU→CPU after each
+    #     use; peak VRAM = largest single component (~12-14 GB bf16). Fits any
+    #     GPU ≥ 24 GB (RTX 4090, A100, H100).
+    #   pipeline.to(DEVICE): all components resident on GPU simultaneously
+    #     (~30 GB bf16). Only for ≥ 40 GB GPUs wanting max throughput.
     if ENABLE_CPU_OFFLOAD:
-        print("Using model CPU offload (peak VRAM ~9 GB)")
+        print("Using model CPU offload (peak VRAM ~12-14 GB)")
         pipeline.enable_model_cpu_offload()
     else:
         pipeline = pipeline.to(DEVICE)
