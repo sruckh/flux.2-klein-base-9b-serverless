@@ -418,7 +418,6 @@ def initialize_pipeline(
     load_kwargs = {
         "torch_dtype": torch_dtype,
         "device_map": "balanced",
-        "attn_implementation": "flash_attention_2" if USE_FLASH_ATTN else "eager",
     }
 
     # Add token if provided (for gated models like black-forest-labs/FLUX.2-klein-base-9B)
@@ -721,7 +720,7 @@ if __name__ == "__main__":
     print(f"Default LoRA Path: {DEFAULT_LORA_PATH if DEFAULT_LORA_PATH else 'None'}")
     print(f"Device: {DEVICE}")
     print(f"Dtype: {DTYPE}")
-    print(f"Flash Attention: {USE_FLASH_ATTN}")
+    print(f"Flash Attention: {USE_FLASH_ATTN} (note: not supported by Flux2Pipeline attn kwarg)")
     print(f"S3 Bucket: {S3_BUCKET_NAME if S3_BUCKET_NAME else 'Not configured'}")
     print(f"HF Token: {'Configured' if HF_TOKEN else 'Not configured (required for gated models)'}")
 
