@@ -410,9 +410,14 @@ def initialize_pipeline(
     # Get torch dtype
     torch_dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Use attn_implementation (replaces deprecated use_flash_attention_2 kwarg)
+    # Use device_map="balanced" so accelerate materialises meta tensors onto the
+    # GPU during loading. This is required for FLUX models which use accelerate
+    # internally and cannot be moved with .to() after the fact.
+    # device_map and enable_model_cpu_offload() are mutually exclusive — we use
+    # device_map for full VRAM placement (H100/A100 80 GB fits the 9B model).
     load_kwargs = {
         "torch_dtype": torch_dtype,
+        "device_map": "balanced",
         "attn_implementation": "flash_attention_2" if USE_FLASH_ATTN else "eager",
     }
 
@@ -422,12 +427,7 @@ def initialize_pipeline(
 
     pipeline = Flux2Pipeline.from_pretrained(model_id, **load_kwargs)
 
-    # Move model fully onto the target device for optimal inference performance.
-    # device_map="auto" and enable_model_cpu_offload() are mutually exclusive;
-    # for H100/A100 80 GB the 9B model (~18 GB at bf16) fits entirely in VRAM.
-    pipeline = pipeline.to(DEVICE)
-
-    # VAE memory optimizations — safe to use alongside .to(device)
+    # VAE memory optimizations — compatible with device_map
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
 
