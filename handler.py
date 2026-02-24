@@ -76,14 +76,14 @@ DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
 DEFAULT_LORA_SCALE = float(os.getenv("DEFAULT_LORA_SCALE", "1.0"))
 
 DEVICE = os.getenv("DEVICE", "cuda")
-DTYPE = os.getenv("DTYPE", "bf16").lower()
+DTYPE = os.getenv("DTYPE", "float8_e4m3fn").lower()
 USE_FLASH_ATTN = os.getenv("USE_FLASH_ATTN", "true").lower() == "true"
 
 # When True, use enable_model_cpu_offload() instead of pipeline.to(DEVICE).
-# Default True — peak VRAM = largest single component (~12-14 GB bf16, ~9 GB fp8).
-# Fits RTX 4090 (24 GB) and 32-80 GB GPUs alike.
-# Set ENABLE_CPU_OFFLOAD=false only for ≥ 40 GB VRAM + max throughput.
-ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "true").lower() == "true"
+# Only needed if total model weight exceeds GPU VRAM (e.g. bf16 on a 32 GB GPU).
+# With DTYPE=float8_e4m3fn the transformer is quantized to fp8 (~9 GB), bringing
+# total to ~14-16 GB — fits RTX 4090 (24 GB) and 32 GB GPUs without offload.
+ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "false").lower() == "true"
 
 # Map dtype string to torch dtype
 DTYPE_MAP = {
@@ -415,20 +415,30 @@ def initialize_pipeline(
 
     dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    load_kwargs = {"torch_dtype": dtype}
+    # Always load from the bf16 base pipeline. fp8 is applied via torchao
+    # quantization below — this avoids the broken from_single_file conversion
+    # path in diffusers (which fails on fp8 scale tensors in the BFL checkpoint
+    # format) and is the officially recommended diffusers approach for fp8 FLUX.
+    pipeline_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+
+    load_kwargs = {"torch_dtype": pipeline_dtype}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
-    # Device placement — two modes:
-    #   enable_model_cpu_offload() (default): components move GPU→CPU after each
-    #     use; peak VRAM = largest single component (~12-14 GB bf16). Fits any
-    #     GPU ≥ 24 GB (RTX 4090, A100, H100).
-    #   pipeline.to(DEVICE): all components resident on GPU simultaneously
-    #     (~30 GB bf16). Only for ≥ 40 GB GPUs wanting max throughput.
+    # fp8 transformer quantization via torchao.
+    # Reduces transformer VRAM from ~18 GB (bf16) to ~9 GB (fp8), bringing the
+    # full pipeline to ~14-16 GB — fits RTX 4090 (24 GB) without any offload.
+    # Text encoders remain at bf16 for quality; only the transformer is quantized.
+    if dtype == torch.float8_e4m3fn:
+        from torchao.quantization import quantize_, float8_weight_only
+        print("Quantizing transformer to fp8 via torchao (target VRAM ~14-16 GB)")
+        quantize_(pipeline.transformer, float8_weight_only())
+        print("fp8 quantization complete")
+
     if ENABLE_CPU_OFFLOAD:
-        print("Using model CPU offload (peak VRAM ~12-14 GB)")
+        print("Using model CPU offload")
         pipeline.enable_model_cpu_offload()
     else:
         pipeline = pipeline.to(DEVICE)

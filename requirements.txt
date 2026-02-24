@@ -25,6 +25,9 @@ sentencepiece>=0.2.0
 # Optional: for progress bars
 tqdm>=4.67.0
 
+# fp8 quantization for transformer (reduces VRAM ~50%, fits 24 GB GPU without offload)
+torchao>=0.9.0
+
 # Optional: for better performance
 protobuf>=5.29.0
 
