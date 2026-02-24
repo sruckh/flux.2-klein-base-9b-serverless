@@ -20,7 +20,7 @@ from typing import Dict, Any, List, Optional, Union
 import boto3
 import torch
 from botocore.exceptions import ClientError
-from diffusers import Flux2KleinPipeline
+from diffusers import Flux2Pipeline
 from PIL import Image
 
 
@@ -160,7 +160,7 @@ PRESETS = {
 # Global Pipeline Instance
 # ============================================================================
 
-pipeline: Optional[Flux2KleinPipeline] = None
+pipeline: Optional[Flux2Pipeline] = None
 model_loaded = False
 lora_path_loaded: str = DEFAULT_LORA_PATH
 
@@ -332,10 +332,10 @@ def upload_to_s3(image: Image.Image, format: str = "jpeg") -> Optional[str]:
 
 
 def load_lora_weights(
-    pipeline: Flux2KleinPipeline,
+    pipeline: Flux2Pipeline,
     lora_path: str,
     lora_scale: float = 1.0
-) -> Flux2KleinPipeline:
+) -> Flux2Pipeline:
     """
     Load LoRA weights onto the pipeline.
 
@@ -391,7 +391,7 @@ def initialize_pipeline(
     model_id: str = DEFAULT_MODEL_ID,
     lora_path: str = "",
     lora_scale: float = DEFAULT_LORA_SCALE,
-) -> Flux2KleinPipeline:
+) -> Flux2Pipeline:
     """
     Initialize the Flux2Klein pipeline with optional LoRA weights.
 
@@ -401,7 +401,7 @@ def initialize_pipeline(
         lora_scale: LoRA weight scaling factor
 
     Returns:
-        Initialized Flux2KleinPipeline
+        Initialized Flux2Pipeline
     """
     global model_loaded
 
@@ -420,7 +420,7 @@ def initialize_pipeline(
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
-    pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
+    pipeline = Flux2Pipeline.from_pretrained(model_id, **load_kwargs)
 
     # Move model fully onto the target device for optimal inference performance.
     # device_map="auto" and enable_model_cpu_offload() are mutually exclusive;
