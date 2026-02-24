@@ -69,7 +69,7 @@ def get_s3_client():
 
 DEFAULT_MODEL_ID = os.getenv(
     "MODEL_ID",
-    "black-forest-labs/FLUX.2-klein-base-9B"
+    "black-forest-labs/FLUX.2-klein-base-9b-fp8"
 )
 
 DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
@@ -78,14 +78,6 @@ DEFAULT_LORA_SCALE = float(os.getenv("DEFAULT_LORA_SCALE", "1.0"))
 DEVICE = os.getenv("DEVICE", "cuda")
 DTYPE = os.getenv("DTYPE", "bf16").lower()
 USE_FLASH_ATTN = os.getenv("USE_FLASH_ATTN", "true").lower() == "true"
-
-# FP8 transformer repo (single-file safetensors, transformer weights only).
-# Used when DTYPE=float8_e4m3fn to swap the bf16 transformer for an fp8 one,
-# saving ~9 GB VRAM (18 GB bf16 → 9 GB fp8) while keeping text encoders at bf16.
-FP8_TRANSFORMER_ID = os.getenv(
-    "FP8_TRANSFORMER_ID",
-    "black-forest-labs/FLUX.2-klein-base-9b-fp8",
-)
 
 # When True, use enable_model_cpu_offload() instead of pipeline.to(DEVICE).
 # Recommended for GPUs with ≤ 24 GB VRAM (e.g. RTX 4090): peak VRAM drops to
@@ -391,10 +383,7 @@ def load_lora_weights(
             # Load from HuggingFace Hub (repo ID)
             pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
 
-        # Set adapter scale using the consistent adapter name
-        pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
-
-        print(f"LoRA weights loaded with scale: {lora_scale}")
+        print(f"LoRA weights loaded (scale applied at call time via cross_attention_kwargs)")
 
     except Exception as e:
         print(f"Warning: Failed to load LoRA weights: {e}")
@@ -419,40 +408,17 @@ def initialize_pipeline(
     Returns:
         Initialized Flux2KleinPipeline
     """
-    import gc
-
     global model_loaded
 
     print(f"Initializing Flux2Klein pipeline with model: {model_id}")
 
     dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Load the full pipeline at bf16.  When fp8 is requested we swap in the
-    # fp8 transformer below; keeping text encoders at bf16 preserves quality.
-    pipeline_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-
-    load_kwargs = {"torch_dtype": pipeline_dtype}
+    load_kwargs = {"torch_dtype": dtype}
     if HF_TOKEN:
         load_kwargs["token"] = HF_TOKEN
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
-
-    # Swap in fp8 transformer when DTYPE=float8_e4m3fn.
-    # Saves ~9 GB VRAM: bf16 transformer (~18 GB) → fp8 (~9 GB).
-    # The fp8 repo contains a single-file safetensors (transformer only).
-    if dtype == torch.float8_e4m3fn and FP8_TRANSFORMER_ID:
-        print(f"Swapping in fp8 transformer from: {FP8_TRANSFORMER_ID}")
-        transformer_class = type(pipeline.transformer)
-        # Release bf16 transformer from CPU RAM before loading fp8 weights.
-        pipeline.transformer = None
-        gc.collect()
-        fp8_kwargs = {"torch_dtype": torch.float8_e4m3fn}
-        if HF_TOKEN:
-            fp8_kwargs["token"] = HF_TOKEN
-        pipeline.transformer = transformer_class.from_single_file(
-            FP8_TRANSFORMER_ID, **fp8_kwargs
-        )
-        print("fp8 transformer loaded")
 
     # Device placement — two modes:
     #   pipeline.to(DEVICE)          : all components on GPU simultaneously
@@ -543,19 +509,18 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         preset = PRESETS[preset_name].copy()
         width = preset.get("width", 1024)
         height = preset.get("height", 1024)
-        num_inference_steps = preset.get("num_inference_steps", 28)
-        guidance_scale = preset.get("guidance_scale", 2.5)
-        max_sequence_length = preset.get("max_sequence_length", 512)
+        num_inference_steps = preset.get("num_inference_steps", 30)
+        guidance_scale = preset.get("guidance_scale", 4.0)
     else:
         width = 1024
         height = 1024
-        num_inference_steps = 28
-        guidance_scale = 2.5
-        max_sequence_length = 512
+        num_inference_steps = 30
+        guidance_scale = 4.0
 
     # Override with explicit values if provided
     prompt = job_input["prompt"]
-    negative_prompt = job_input.get("negative_prompt", "")
+    # negative_prompt is accepted in the API schema for compatibility but is
+    # NOT passed to Flux2KleinPipeline — it does not support negative prompts.
     if "width" in job_input:
         width = job_input["width"]
     if "height" in job_input:
@@ -564,8 +529,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         num_inference_steps = job_input["num_inference_steps"]
     if "guidance_scale" in job_input:
         guidance_scale = job_input["guidance_scale"]
-    if "max_sequence_length" in job_input:
-        max_sequence_length = job_input["max_sequence_length"]
 
     seed = job_input.get("seed", -1)
     num_images = job_input.get("num_images", 1)
@@ -597,16 +560,15 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     with torch.inference_mode():
         result = pipeline(
             prompt=prompt,
-            negative_prompt=negative_prompt if negative_prompt else None,
+            # negative_prompt is NOT supported by Flux2KleinPipeline — omit entirely.
             width=width,
             height=height,
             num_inference_steps=num_inference_steps,
             guidance_scale=guidance_scale,
             generator=generator,
             num_images_per_prompt=num_images,
-            max_sequence_length=max_sequence_length,
-            # Pass LoRA scale through attention kwargs when a LoRA is active
-            joint_attention_kwargs={"scale": current_lora_scale} if current_lora_path else None,
+            # cross_attention_kwargs is the correct mechanism for LoRA scale at call time.
+            cross_attention_kwargs={"scale": current_lora_scale} if current_lora_path else None,
         )
 
     generation_time = time.time() - start_time
@@ -638,7 +600,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "guidance_scale": guidance_scale,
                 "seed": seed,
                 "num_images": num_images,
-                "max_sequence_length": max_sequence_length,
                 "shift": shift,
             },
             "metadata": {
@@ -670,7 +631,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "guidance_scale": guidance_scale,
                 "seed": seed,
                 "num_images": num_images,
-                "max_sequence_length": max_sequence_length,
                 "shift": shift,
             },
             "metadata": {
