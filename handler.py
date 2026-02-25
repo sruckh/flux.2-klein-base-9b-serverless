@@ -22,6 +22,10 @@ from typing import Dict, Any, List, Optional, Union
 # blocks instead of requiring a contiguous free region — prevents OOM on 24 GB
 # GPUs where Marlin fp8 packing needs a small extra allocation after loading.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Disable Marlin fp8 kernels — they require contiguous input tensors which
+# diffusers does not guarantee during the transformer forward pass, causing
+# "RuntimeError: A is not contiguous". Non-Marlin fp8 handles arbitrary layout.
+os.environ.setdefault("QUANTO_DISABLE_MARLIN", "1")
 
 import boto3
 import torch
@@ -363,7 +367,7 @@ def load_lora_weights(
         The pipeline with loaded LoRA weights
     """
     if not lora_path or lora_path.strip() == "":
-        return pipeline
+        return pipeline, False
 
     print(f"Loading LoRA weights from: {lora_path}")
 
@@ -390,13 +394,14 @@ def load_lora_weights(
             # Load from HuggingFace Hub (repo ID)
             pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
 
-        print(f"LoRA weights loaded (scale applied at call time via cross_attention_kwargs)")
+        print(f"LoRA weights loaded successfully")
+        return pipeline, True
 
     except Exception as e:
-        print(f"Warning: Failed to load LoRA weights: {e}")
+        print(f"ERROR: Failed to load LoRA weights from '{lora_path}': {e}")
         # Continue without LoRA
 
-    return pipeline
+    return pipeline, False
 
 
 def initialize_pipeline(
@@ -467,7 +472,7 @@ def initialize_pipeline(
 
     # Load LoRA if specified
     if lora_path:
-        pipeline = load_lora_weights(pipeline, lora_path, lora_scale)
+        pipeline, _ = load_lora_weights(pipeline, lora_path, lora_scale)
 
     # Warm up the pipeline
     print("Warming up pipeline...")
@@ -518,9 +523,11 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     if current_lora_path != lora_path_loaded:
         if lora_path_loaded:
             pipeline.unload_lora_weights()
+            lora_path_loaded = ""
         if current_lora_path:
-            pipeline = load_lora_weights(pipeline, current_lora_path, current_lora_scale)
-        lora_path_loaded = current_lora_path
+            pipeline, lora_ok = load_lora_weights(pipeline, current_lora_path, current_lora_scale)
+            if lora_ok:
+                lora_path_loaded = current_lora_path
 
     # Extract parameters - apply preset first, then override with explicit values
     preset_name = job_input.get("preset", "realistic_character")
@@ -573,9 +580,9 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # Apply LoRA scale before each inference call.
-    # Flux2KleinPipeline does not accept cross_attention_kwargs; set_adapters()
-    # is the correct mechanism to update the adapter weight at call time.
-    if current_lora_path:
+    # Only call set_adapters when the adapter is actually registered (lora_path_loaded
+    # is only set on successful load, so this guards against silent load failures).
+    if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=current_lora_scale)
 
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
