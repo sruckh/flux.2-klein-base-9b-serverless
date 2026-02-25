@@ -17,6 +17,12 @@ import urllib.request
 import uuid
 from typing import Dict, Any, List, Optional, Union
 
+# Must be set before CUDA initialises (before `import torch` triggers CUDA init).
+# expandable_segments lets PyTorch reuse fragmented reserved-but-unallocated
+# blocks instead of requiring a contiguous free region — prevents OOM on 24 GB
+# GPUs where Marlin fp8 packing needs a small extra allocation after loading.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import boto3
 import torch
 from botocore.exceptions import ClientError
