@@ -427,14 +427,17 @@ def initialize_pipeline(
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
-    # fp8 transformer quantization via torchao.
+    # fp8 transformer quantization via optimum-quanto.
     # Reduces transformer VRAM from ~18 GB (bf16) to ~9 GB (fp8), bringing the
     # full pipeline to ~14-16 GB — fits RTX 4090 (24 GB) without any offload.
     # Text encoders remain at bf16 for quality; only the transformer is quantized.
+    # Weights are quantized on CPU before pipeline.to(DEVICE) so the GPU move is
+    # already at reduced size — no OOM during loading.
     if dtype == torch.float8_e4m3fn:
-        from torchao.quantization import quantize_, float8_weight_only
-        print("Quantizing transformer to fp8 via torchao (target VRAM ~14-16 GB)")
-        quantize_(pipeline.transformer, float8_weight_only())
+        from optimum.quanto import freeze, qfloat8, quantize
+        print("Quantizing transformer to fp8 via optimum-quanto (target VRAM ~14-16 GB)")
+        quantize(pipeline.transformer, weights=qfloat8)
+        freeze(pipeline.transformer)
         print("fp8 quantization complete")
 
     if ENABLE_CPU_OFFLOAD:
