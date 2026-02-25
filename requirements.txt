@@ -11,6 +11,7 @@ diffusers @ git+https://github.com/huggingface/diffusers.git
 transformers>=4.47.0
 accelerate>=1.2.0
 huggingface-hub>=0.28.0
+peft>=0.14.0
 
 # Flash Attention (installed via wheel in Dockerfile)
 # flash_attn
