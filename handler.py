@@ -572,6 +572,12 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         shift=shift,
     )
 
+    # Apply LoRA scale before each inference call.
+    # Flux2KleinPipeline does not accept cross_attention_kwargs; set_adapters()
+    # is the correct mechanism to update the adapter weight at call time.
+    if current_lora_path:
+        pipeline.set_adapters("flux_lora", adapter_weights=current_lora_scale)
+
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
           f"guidance={guidance_scale}, shift={shift}")
 
@@ -588,8 +594,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
             guidance_scale=guidance_scale,
             generator=generator,
             num_images_per_prompt=num_images,
-            # cross_attention_kwargs is the correct mechanism for LoRA scale at call time.
-            cross_attention_kwargs={"scale": current_lora_scale} if current_lora_path else None,
         )
 
     generation_time = time.time() - start_time
