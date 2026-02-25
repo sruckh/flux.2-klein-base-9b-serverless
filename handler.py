@@ -189,11 +189,6 @@ INPUT_SCHEMA = {
         "required": True,
         "constraints": lambda x: len(x.strip()) > 0,
     },
-    "negative_prompt": {
-        "type": str,
-        "required": False,
-        "default": "",
-    },
     "preset": {
         "type": str,
         "required": False,
@@ -554,8 +549,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
 
     # Override with explicit values if provided
     prompt = job_input["prompt"]
-    # negative_prompt is accepted in the API schema for compatibility but is
-    # NOT passed to Flux2KleinPipeline — it does not support negative prompts.
     if "width" in job_input:
         width = job_input["width"]
     if "height" in job_input:
@@ -632,7 +625,6 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
             "return_type": "s3",
             "parameters": {
                 "prompt": prompt,
-                "negative_prompt": negative_prompt,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,
@@ -656,14 +648,13 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         images_base64 = []
         for img in result.images:
             images_base64.append(encode_image_to_base64(img, output_format))
-        
+
         response = {
             "images": images_base64,
             "format": output_format,
             "return_type": "base64",
             "parameters": {
                 "prompt": prompt,
-                "negative_prompt": negative_prompt,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,
