@@ -21,11 +21,12 @@ from typing import Dict, Any, List, Optional, Union
 # expandable_segments lets PyTorch reuse fragmented reserved-but-unallocated
 # blocks instead of requiring a contiguous free region — prevents OOM on 24 GB
 # GPUs where Marlin fp8 packing needs a small extra allocation after loading.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Disable Marlin fp8 kernels — they require contiguous input tensors which
 # diffusers does not guarantee during the transformer forward pass, causing
 # "RuntimeError: A is not contiguous". Non-Marlin fp8 handles arbitrary layout.
-os.environ.setdefault("QUANTO_DISABLE_MARLIN", "1")
+# Use direct assignment (not setdefault) so RunPod env vars cannot override this.
+os.environ["QUANTO_DISABLE_MARLIN"] = "1"
 
 import boto3
 import torch
@@ -470,9 +471,10 @@ def initialize_pipeline(
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
 
-    # Load LoRA if specified
+    # Load LoRA if specified — capture success flag so caller can track state
+    lora_ok = False
     if lora_path:
-        pipeline, _ = load_lora_weights(pipeline, lora_path, lora_scale)
+        pipeline, lora_ok = load_lora_weights(pipeline, lora_path, lora_scale)
 
     # Warm up the pipeline
     print("Warming up pipeline...")
@@ -489,7 +491,7 @@ def initialize_pipeline(
         print(f"Warning: Pipeline warmup failed: {e}")
 
     model_loaded = True
-    return pipeline
+    return pipeline, lora_ok
 
 
 # ============================================================================
@@ -513,8 +515,8 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
         lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
         lora_scale = job_input.get("lora_scale", DEFAULT_LORA_SCALE)
-        pipeline = initialize_pipeline(model_id, lora_path, lora_scale)
-        lora_path_loaded = lora_path
+        pipeline, lora_ok = initialize_pipeline(model_id, lora_path, lora_scale)
+        lora_path_loaded = lora_path if lora_ok else ""
 
     # Handle LoRA change without reloading the full pipeline
     current_lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)

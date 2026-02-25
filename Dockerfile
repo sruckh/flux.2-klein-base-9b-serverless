@@ -15,7 +15,9 @@ ENV PYTHONUNBUFFERED=1 \
     HF_XET_NUM_CONCURRENT_RANGE_GETS=32 \
     HF_HUB_ETAG_TIMEOUT=30 \
     HF_HUB_DOWNLOAD_TIMEOUT=300 \
-    HF_HUB_DISABLE_PROGRESS_BARS=1
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    QUANTO_DISABLE_MARLIN=1
 
 # Install Python 3.12 and system dependencies (no python3-pip — use get-pip.py instead)
 RUN apt-get update && apt-get install -y \
