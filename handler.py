@@ -446,11 +446,16 @@ def initialize_pipeline(
     # Weights are quantized on CPU before pipeline.to(DEVICE) so the GPU move is
     # already at reduced size — no OOM during loading.
     if dtype == torch.float8_e4m3fn:
-        from optimum.quanto import freeze, qfloat8, quantize
-        print("Quantizing transformer to fp8 via optimum-quanto (target VRAM ~14-16 GB)")
-        quantize(pipeline.transformer, weights=qfloat8)
+        # Use qint8 instead of qfloat8. The qfloat8 path in optimum-quanto
+        # packs weights into MarlinF8QBytesTensor on CUDA, which requires
+        # contiguous inputs — diffusers does not guarantee this, causing
+        # "RuntimeError: A is not contiguous". qint8 uses a separate code
+        # path with no Marlin dependency and the same ~8-bit storage savings.
+        from optimum.quanto import freeze, qint8, quantize
+        print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
+        quantize(pipeline.transformer, weights=qint8)
         freeze(pipeline.transformer)
-        print("fp8 quantization complete")
+        print("int8 quantization complete")
 
     if ENABLE_CPU_OFFLOAD:
         print("Using model CPU offload")
