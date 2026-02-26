@@ -116,56 +116,58 @@ DTYPE_MAP = {
 # ============================================================================
 
 PRESETS = {
-    # Ultra-realistic human character/portrait LoRA.
-    # Base model (undistilled): use 25-50 steps, guidance 3.5-5.0.
-    # DO NOT use low step counts (4-8) — that is for distilled variants only.
+    # Primary preset for photorealistic human portraits with character LoRA.
+    # FLUX.2-klein-base (undistilled): guidance 2.5 avoids the over-rendered
+    # plastic look that higher values produce. shift=2.0 yields natural skin
+    # texture and lighting rather than hyper-stylised structure.
     "realistic_character": {
-        "num_inference_steps": 30,
-        "guidance_scale": 4.0,
+        "num_inference_steps": 35,
+        "guidance_scale": 2.5,
+        "shift": 2.0,
         "width": 1024,
         "height": 1024,
-        "max_sequence_length": 512,
-        "description": "Ultra-realistic human character with natural lighting"
+        "description": "Photorealistic human portrait — square crop"
     },
 
-    # High-quality portrait with enhanced detail
+    # Portrait orientation (2:3) — most natural for head/shoulders shots.
+    # Slightly more steps for the extra pixel budget.
     "portrait_hd": {
-        "num_inference_steps": 30,
-        "guidance_scale": 4.0,
+        "num_inference_steps": 40,
+        "guidance_scale": 2.5,
+        "shift": 2.0,
         "width": 1024,
-        "height": 1536,  # 2:3 portrait ratio
-        "max_sequence_length": 512,
-        "description": "High-detail portrait with vertical composition"
+        "height": 1536,
+        "description": "Photorealistic portrait — 2:3 vertical crop"
     },
 
-    # Cinematic full-body character shot
+    # Full-body or environmental shot in cinematic 3:2 ratio.
     "cinematic_full": {
-        "num_inference_steps": 30,
-        "guidance_scale": 4.5,
+        "num_inference_steps": 35,
+        "guidance_scale": 3.0,
+        "shift": 2.0,
         "width": 1536,
-        "height": 1024,  # 3:2 cinematic ratio
-        "max_sequence_length": 512,
-        "description": "Cinematic full-body character composition"
+        "height": 1024,
+        "description": "Cinematic full-body or environment shot — 3:2 horizontal"
     },
 
-    # Fast iteration for prompt testing
+    # Fast iteration for prompt / seed testing — not for final output.
     "fast_preview": {
-        "num_inference_steps": 25,
-        "guidance_scale": 3.5,
+        "num_inference_steps": 20,
+        "guidance_scale": 2.5,
+        "shift": 2.0,
         "width": 1024,
         "height": 1024,
-        "max_sequence_length": 512,
-        "description": "Fast preview for prompt testing"
+        "description": "Quick preview for prompt and seed exploration"
     },
 
-    # Maximum quality for final output
+    # Highest quality — use for hero shots where generation time is acceptable.
     "maximum_quality": {
         "num_inference_steps": 50,
-        "guidance_scale": 5.0,
+        "guidance_scale": 3.0,
+        "shift": 1.5,
         "width": 1024,
         "height": 1024,
-        "max_sequence_length": 512,
-        "description": "Maximum quality generation (slower)"
+        "description": "Maximum quality — slowest, most detail"
     },
 }
 
@@ -458,13 +460,12 @@ def initialize_pipeline(
     else:
         pipeline = pipeline.to(DEVICE)
 
-    # Set scheduler with shift=3.0 (recommended for character LoRAs by BFL).
-    # FlowMatchEulerDiscreteScheduler is the native scheduler for FLUX.2 Klein.
-    # shift=3.0 biases the noise schedule toward high-noise timesteps, improving
-    # face/skin coherence and large structure quality.
+    # Set scheduler with shift=2.0 — default for photorealistic character output.
+    # Lower shift = more time at fine-detail timesteps = natural skin/texture.
+    # Overridden per-request in generate_images(); this value only affects warmup.
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipeline.scheduler.config,
-        shift=3.0,
+        shift=2.0,
     )
 
     # VAE memory optimizations
@@ -539,13 +540,15 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         preset = PRESETS[preset_name].copy()
         width = preset.get("width", 1024)
         height = preset.get("height", 1024)
-        num_inference_steps = preset.get("num_inference_steps", 30)
-        guidance_scale = preset.get("guidance_scale", 4.0)
+        num_inference_steps = preset.get("num_inference_steps", 35)
+        guidance_scale = preset.get("guidance_scale", 2.5)
+        shift = preset.get("shift", 2.0)
     else:
         width = 1024
         height = 1024
-        num_inference_steps = 30
-        guidance_scale = 4.0
+        num_inference_steps = 35
+        guidance_scale = 2.5
+        shift = 2.0
 
     # Override with explicit values if provided
     prompt = job_input["prompt"]
@@ -557,6 +560,8 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         num_inference_steps = job_input["num_inference_steps"]
     if "guidance_scale" in job_input:
         guidance_scale = job_input["guidance_scale"]
+    if "shift" in job_input:
+        shift = job_input["shift"]
 
     seed = job_input.get("seed", -1)
     num_images = job_input.get("num_images", 1)
@@ -570,10 +575,8 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         seed = int(time.time() * 1000) % (2**31)
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # Apply scheduler shift per request. shift=3.0 is the BFL-recommended default
-    # for character LoRAs. Users can tune 1.0–7.0: higher = more time at high-noise
-    # levels = better large-structure coherence.
-    shift = job_input.get("shift", 3.0)
+    # shift controls noise schedule bias: lower = more organic detail/skin texture,
+    # higher = stronger large-structure coherence. 2.0 is the photorealism default.
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipeline.scheduler.config,
         shift=shift,
