@@ -591,55 +591,114 @@ def run_2nd_pass(
     lora_scale: float,
 ) -> Image.Image:
     """
-    Low-denoise img2img 2nd pass using the already-loaded Flux2KleinPipeline.
+    Low-denoise img2img 2nd pass via manual VAE encode + partial noise injection.
 
-    Equivalent to a ComfyUI KSampler pass with denoise=strength.
-    The same LoRA (if loaded) stays active, preserving subject identity while
-    adding fine skin texture, pore detail, and micro-contrast.
+    Flux2KleinPipeline is text-to-image only and does not accept `image` or
+    `strength` parameters. This function implements img2img manually:
+
+      1. Encodes the input PIL image to clean VAE latents
+      2. Adds flow-matching noise at the sigma level corresponding to `strength`
+         using the interpolation:  x_t = (1−σ) · x_clean + σ · noise
+      3. Packs latents into FLUX's 2×2 patch-sequence format
+      4. Calls the existing pipeline with those pre-noised latents and a custom
+         sigma schedule that starts at our chosen noise level — skipping the
+         fully-noisy portion of the schedule entirely
+
+    This is exactly equivalent to a ComfyUI KSampler detailer pass with
+    denoise=strength. The loaded LoRA stays active, preserving subject identity
+    while adding fine skin texture, pore detail, and micro-contrast.
 
     Args:
         image: Output from the 1st generation pass (PIL RGB).
         prompt: Same prompt used for the 1st pass.
-        strength: Fraction of steps to apply (0.05–0.95). 0.3 recommended —
-                  adds detail without drifting from the original composition.
-        num_steps: Total inference steps for this pass (actual steps applied =
-                   num_steps × strength, matching the diffusers convention).
+        strength: Fraction of sigma schedule to run (0.05–0.95).
+                  0.3 recommended — adds detail without composition drift.
+        num_steps: Reference step count; actual denoising steps ≈ steps × strength.
         guidance_scale: Classifier-free guidance scale (match 1st pass).
         shift: Flow-matching shift value (match 1st pass).
-        generator: Seeded RNG for reproducibility.
-        lora_path_loaded: Name of the loaded LoRA adapter (empty if none).
-        lora_scale: LoRA adapter weight to apply.
+        generator: Seeded RNG — reused for noise reproducibility.
+        lora_path_loaded: Loaded LoRA adapter name (empty if none).
+        lora_scale: LoRA adapter weight.
 
     Returns:
         Refined PIL Image.
     """
     global pipeline
 
+    w, h = image.size
+    vae = pipeline.vae
+
     print(
         f"2nd pass detailer: strength={strength}, steps={num_steps}, "
         f"guidance={guidance_scale}, shift={shift}"
     )
 
-    # Re-apply scheduler shift (same value as 1st pass; cheap operation)
+    # --- Scheduler (same config as 1st pass) ---
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipeline.scheduler.config,
-        shift=shift,
+        pipeline.scheduler.config, shift=shift,
     )
-
     if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
 
-    start = time.time()
+    # --- Build the full sigma schedule, then slice at the strength point ---
+    # all_sigmas: length num_steps+1, decreasing from σ_max → 0.0
+    pipeline.scheduler.set_timesteps(num_steps, device=DEVICE)
+    all_sigmas = pipeline.scheduler.sigmas.cpu()
+
+    # strength=0.3 → skip 70% of steps; run only the last 30%.
+    # skip_n indexes into all_sigmas where our partial schedule begins.
+    skip_n = max(0, min(int(num_steps * (1.0 - strength)), num_steps - 1))
+    start_sigma = all_sigmas[skip_n].item()
+    custom_sigmas = all_sigmas[skip_n:].tolist()
+    actual_steps = len(custom_sigmas) - 1  # sigmas list is always steps+1
+
+    print(f"  start_sigma={start_sigma:.4f}, actual_denoising_steps={actual_steps}")
+
+    # --- VAE encode: PIL RGB → clean latents ---
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)  # typically 8
+
+    img_arr = np.array(image.convert("RGB")).astype(np.float32) / 127.5 - 1.0
+    img_t = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0)
+    img_t = img_t.to(DEVICE, dtype=vae.dtype)
+
+    with torch.inference_mode():
+        clean_latent = vae.encode(img_t).latent_dist.sample(generator)
+
+    # Normalize latents using VAE config values (FLUX VAE: shift≈0.1159, scale≈0.3611)
+    shift_f = getattr(vae.config, "shift_factor", 0.0)
+    scale_f = getattr(vae.config, "scaling_factor", 1.0)
+    clean_latent = (clean_latent - shift_f) * scale_f
+
+    # --- Flow-matching noise injection at start_sigma ---
+    # FLUX flow matching interpolation: x_t = (1−σ)·x_clean + σ·noise
+    # σ=0 → clean image, σ=1 → pure noise; strength=0.3 → σ≈0.3
+    noise = torch.randn(
+        clean_latent.shape, generator=generator, device=DEVICE, dtype=clean_latent.dtype
+    )
+    noisy_latent = (1.0 - start_sigma) * clean_latent + start_sigma * noise
+
+    # --- Pack into FLUX's patch-sequence format ---
+    # VAE latent: (B, C, H_lat, W_lat) — FLUX uses 2×2 spatial patches
+    # Packed:     (B, H_lat/2 · W_lat/2, C·4)
+    bsz, nc, lat_h, lat_w = noisy_latent.shape
+    ph, pw = lat_h // 2, lat_w // 2
+    packed = noisy_latent.view(bsz, nc, ph, 2, pw, 2)
+    packed = packed.permute(0, 2, 4, 1, 3, 5).reshape(bsz, ph * pw, nc * 4)
+
+    # --- Denoise from our partial-noise starting point ---
+    t0 = time.time()
     with torch.inference_mode():
         result = pipeline(
             prompt=prompt,
-            image=image,
-            strength=strength,
-            num_inference_steps=num_steps,
+            height=h,
+            width=w,
+            num_inference_steps=actual_steps,
             guidance_scale=guidance_scale,
             generator=generator,
+            latents=packed,
+            sigmas=custom_sigmas,
         )
-    print(f"2nd pass complete in {time.time() - start:.2f}s")
+    print(f"2nd pass complete in {time.time() - t0:.2f}s")
     return result.images[0]
 
 
