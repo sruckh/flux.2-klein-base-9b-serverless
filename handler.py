@@ -679,15 +679,16 @@ def run_2nd_pass(
     )
     noisy_latent = (1.0 - start_sigma) * clean_latent + start_sigma * noise
 
-    # --- Debug: log shapes to diagnose any format mismatch ---
-    print(f"  [dbg] image.size (PIL w,h)={image.size}")
-    print(f"  [dbg] noisy_latent.shape={noisy_latent.shape}  dtype={noisy_latent.dtype}")
-    print(f"  [dbg] transformer.in_channels={pipeline.transformer.config.in_channels}")
-    print(f"  [dbg] vae_scale_factor={vae_scale_factor}  vae.config.latent_channels={getattr(vae.config, 'latent_channels', 'N/A')}")
+    # --- Convert VAE latents to pipeline's internal format ---
+    # VAE produces (B, C, H_lat, W_lat) = (1, 32, 128, 128).
+    # pipeline_flux2_klein.prepare_latents generates noise at shape
+    # (B, C*4, H_lat//2, W_lat//2) = (1, 128, 64, 64) then flat-reshapes
+    # to [B, H*W, C] = (1, 4096, 128) for the transformer.
+    # pixel_unshuffle(r=2) is the matching space-to-depth op:
+    # (1, 32, 128, 128) → (1, 128, 64, 64)
+    noisy_latent_packed = torch.nn.functional.pixel_unshuffle(noisy_latent, downscale_factor=2)
 
     # --- Denoise from our partial-noise starting point ---
-    # Pass noisy_latent as 4D (B, C, H_lat, W_lat); the pipeline's prepare_latents
-    # / _prepare_latent_ids handles packing into patch-sequence format internally.
     t0 = time.time()
     with torch.inference_mode():
         result = pipeline(
@@ -697,7 +698,7 @@ def run_2nd_pass(
             num_inference_steps=actual_steps,
             guidance_scale=guidance_scale,
             generator=generator,
-            latents=noisy_latent,
+            latents=noisy_latent_packed,
             sigmas=custom_sigmas,
         )
     print(f"2nd pass complete in {time.time() - t0:.2f}s")
