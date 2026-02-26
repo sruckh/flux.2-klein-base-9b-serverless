@@ -19,6 +19,7 @@ peft>=0.14.0
 # Image processing
 Pillow>=11.1.0
 safetensors>=0.4.6
+spandrel>=0.4.0
 
 # Sentence piece for tokenizers
 sentencepiece>=0.2.0

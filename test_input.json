@@ -7,6 +7,11 @@
     "output_format": "jpeg",
     "return_type": "s3",
     "lora_path": "",
-    "lora_scale": 0.85
+    "lora_scale": 0.85,
+    "enable_2nd_pass": true,
+    "second_pass_strength": 0.3,
+    "second_pass_steps": 20,
+    "enable_upscale": true,
+    "upscale_factor": 2.0
   }
 }

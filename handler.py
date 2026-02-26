@@ -17,6 +17,8 @@ import urllib.request
 import uuid
 from typing import Dict, Any, List, Optional, Union
 
+import numpy as np
+
 # Must be set before CUDA initialises (before `import torch` triggers CUDA init).
 # expandable_segments lets PyTorch reuse fragmented reserved-but-unallocated
 # blocks instead of requiring a contiguous free region — prevents OOM on 24 GB
@@ -108,6 +110,24 @@ DTYPE_MAP = {
 
 
 # ============================================================================
+# Upscaler Configuration
+# ============================================================================
+
+# DRCT-L 4x super-resolution model trained on real-world web photos.
+# Source: https://github.com/Phhofm/models
+UPSCALER_MODEL_URL = (
+    "https://github.com/Phhofm/models/releases/download/"
+    "4xRealWebPhoto_v4_drct-l/4xRealWebPhoto_v4_drct-l.pth"
+)
+UPSCALER_MODEL_PATH = os.getenv(
+    "UPSCALER_MODEL_PATH",
+    "/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth",
+)
+UPSCALE_TILE_SIZE = 512    # input-space tile size in pixels
+UPSCALE_TILE_OVERLAP = 32  # input-space overlap between tiles in pixels
+
+
+# ============================================================================
 # Optimized Presets for Different Use Cases
 # Based on research from:
 # - Black Forest Labs FLUX.2 documentation
@@ -179,6 +199,7 @@ PRESETS = {
 pipeline: Optional[Flux2KleinPipeline] = None
 model_loaded = False
 lora_path_loaded: str = DEFAULT_LORA_PATH
+upscaler_model = None  # spandrel ImageModelDescriptor, loaded on first upscale request
 
 
 # ============================================================================
@@ -267,6 +288,40 @@ INPUT_SCHEMA = {
         "default": 3.0,  # BFL recommendation: 3.0 for character LoRAs; tune 1.0-7.0
         "constraints": lambda x: 0.1 <= x <= 10.0,
     },
+    # -------------------------------------------------------------------------
+    # 2nd Pass Detailer (low-denoise img2img for fine detail refinement)
+    # -------------------------------------------------------------------------
+    "enable_2nd_pass": {
+        "type": bool,
+        "required": False,
+        "default": False,
+    },
+    "second_pass_strength": {
+        "type": float,
+        "required": False,
+        "default": 0.3,  # 0.3 ≈ ComfyUI 0.3 denoise KSampler pass; keeps subject intact
+        "constraints": lambda x: 0.05 <= x <= 0.95,
+    },
+    "second_pass_steps": {
+        "type": int,
+        "required": False,
+        "default": 20,
+        "constraints": lambda x: 5 <= x <= 50,
+    },
+    # -------------------------------------------------------------------------
+    # Tiled Upscaler (DRCT-L 4x → resize to target factor)
+    # -------------------------------------------------------------------------
+    "enable_upscale": {
+        "type": bool,
+        "required": False,
+        "default": False,
+    },
+    "upscale_factor": {
+        "type": float,
+        "required": False,
+        "default": 2.0,  # 2.0 = 4x DRCT then resize to 2x (2048×2048 from 1024×1024)
+        "constraints": lambda x: 0.25 <= x <= 4.0,
+    },
 }
 
 
@@ -346,6 +401,246 @@ def upload_to_s3(image: Image.Image, format: str = "jpeg") -> Optional[str]:
     except ClientError as e:
         print(f"Error uploading to S3: {e}")
         return None
+
+
+def download_upscaler_model() -> str:
+    """
+    Ensure the DRCT-L upscaler .pth is present on the network volume.
+    Downloads from GitHub releases if not already cached.
+
+    Returns:
+        Absolute path to the cached model file.
+    """
+    model_path = UPSCALER_MODEL_PATH
+    if os.path.exists(model_path):
+        print(f"Upscaler model already cached: {model_path}")
+        return model_path
+
+    model_dir = os.path.dirname(model_path)
+    os.makedirs(model_dir, exist_ok=True)
+    print(f"Downloading upscaler model from:\n  {UPSCALER_MODEL_URL}")
+    try:
+        urllib.request.urlretrieve(UPSCALER_MODEL_URL, model_path)
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        print(f"Upscaler model downloaded ({size_mb:.1f} MB) → {model_path}")
+    except Exception as e:
+        # Clean up partial download
+        if os.path.exists(model_path):
+            os.remove(model_path)
+        raise RuntimeError(f"Failed to download upscaler model: {e}") from e
+    return model_path
+
+
+def load_upscaler():
+    """
+    Load and cache the DRCT-L upscaler model via spandrel (lazy, one-time).
+
+    Returns:
+        spandrel ImageModelDescriptor in CUDA eval mode.
+    """
+    global upscaler_model
+    if upscaler_model is not None:
+        return upscaler_model
+
+    from spandrel import ImageModelDescriptor, ModelLoader
+
+    model_path = download_upscaler_model()
+    print(f"Loading upscaler model from {model_path} ...")
+    model = ModelLoader().load_from_file(model_path)
+    if not isinstance(model, ImageModelDescriptor):
+        raise RuntimeError(
+            f"Upscaler model is not an ImageModelDescriptor (got {type(model).__name__}). "
+            "Check that the .pth file is a valid super-resolution model."
+        )
+    model = model.cuda().eval()
+    upscaler_model = model
+    print(f"Upscaler loaded: {model.architecture.name}, scale={model.scale}x")
+    return upscaler_model
+
+
+def tiled_upscale(
+    image: Image.Image,
+    upscale_factor: float = 2.0,
+    tile_size: int = UPSCALE_TILE_SIZE,
+    overlap: int = UPSCALE_TILE_OVERLAP,
+) -> Image.Image:
+    """
+    Upscale a PIL image using the DRCT-L 4x model with tiled inference.
+    Tiles are feather-blended to eliminate seam artifacts.
+
+    Workflow:
+        1. Convert PIL → float32 NCHW tensor [0, 1]
+        2. Slice into overlapping tile_size×tile_size patches (input-space)
+        3. Run each patch through DRCT-L on GPU (output is 4× larger)
+        4. Accumulate patches into output buffer using a linear-ramp weight
+           kernel (feathering) to blend seams
+        5. Divide by accumulated weight → final image
+        6. If upscale_factor < 4.0, resize down with LANCZOS
+
+    Args:
+        image: Input PIL Image (RGB).
+        upscale_factor: Target output scale relative to input (0.25–4.0).
+                        DRCT-L always runs at 4x; result is resized if needed.
+        tile_size: Tile edge length in input pixels (default 512).
+        overlap: Overlap between adjacent tiles in input pixels (default 32).
+
+    Returns:
+        Upscaled PIL Image (RGB).
+    """
+    model = load_upscaler()
+    model_scale = model.scale  # 4 for DRCT-L
+
+    img_np = np.array(image.convert("RGB")).astype(np.float32) / 255.0
+    # HWC → CHW → NCHW (kept on CPU until each tile is dispatched to GPU)
+    img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)
+
+    in_h, in_w = img_tensor.shape[2], img_tensor.shape[3]
+    out_h = in_h * model_scale
+    out_w = in_w * model_scale
+
+    # Accumulation buffers live on CPU to keep VRAM free for subsequent tiles
+    output = torch.zeros((1, 3, out_h, out_w), dtype=torch.float32)
+    weight = torch.zeros((1, 1, out_h, out_w), dtype=torch.float32)
+
+    step = tile_size - overlap  # stride between tile origins
+
+    def _make_blend_kernel(h: int, w: int, fade: int) -> torch.Tensor:
+        """
+        Linear-ramp weight mask that feathers the tile edges.
+        Values near edges ramp from 0 → 1 over `fade` pixels so that
+        overlapping tiles blend smoothly without hard seams.
+        """
+        kern = torch.ones(h, w, dtype=torch.float32)
+        for i in range(fade):
+            v = (i + 1) / (fade + 1)
+            kern[i, :] *= v
+            kern[-(i + 1), :] *= v
+            kern[:, i] *= v
+            kern[:, -(i + 1)] *= v
+        return kern.unsqueeze(0).unsqueeze(0)  # shape: (1, 1, H, W)
+
+    # Build deduplicated list of tile top-left corners
+    def _tile_coords(length: int) -> List[int]:
+        coords = list(range(0, max(1, length - tile_size), step))
+        last = max(0, length - tile_size)
+        if not coords or coords[-1] != last:
+            coords.append(last)
+        return coords
+
+    y_starts = _tile_coords(in_h)
+    x_starts = _tile_coords(in_w)
+    total_tiles = len(y_starts) * len(x_starts)
+
+    print(
+        f"Tiled upscale: {in_w}x{in_h} → {out_w}x{out_h} "
+        f"({total_tiles} tiles, tile={tile_size}px, overlap={overlap}px)"
+    )
+
+    for y in y_starts:
+        y_end = min(y + tile_size, in_h)
+        for x in x_starts:
+            x_end = min(x + tile_size, in_w)
+
+            tile = img_tensor[:, :, y:y_end, x:x_end].to(DEVICE)
+
+            with torch.inference_mode():
+                tile_out = model(tile).cpu().clamp(0.0, 1.0)
+
+            # Output-space coordinates for this tile
+            oy = y * model_scale
+            ox = x * model_scale
+            oy_end = oy + tile_out.shape[2]
+            ox_end = ox + tile_out.shape[3]
+
+            kern = _make_blend_kernel(
+                tile_out.shape[2],
+                tile_out.shape[3],
+                overlap * model_scale,
+            )
+            output[:, :, oy:oy_end, ox:ox_end] += tile_out * kern
+            weight[:, :, oy:oy_end, ox:ox_end] += kern
+
+            del tile, tile_out
+
+    # Normalize by accumulated blend weights
+    output = (output / weight.clamp(min=1e-8)).clamp(0.0, 1.0)
+
+    # NCHW float32 → HWC uint8 → PIL
+    out_np = (output.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
+    result_img = Image.fromarray(out_np, "RGB")
+
+    # If target factor differs from the model's native 4x, resize to requested size
+    if abs(upscale_factor - model_scale) > 0.01:
+        target_w = int(round(in_w * upscale_factor))
+        target_h = int(round(in_h * upscale_factor))
+        result_img = result_img.resize((target_w, target_h), Image.LANCZOS)
+        print(f"Resized 4x output → {target_w}x{target_h} ({upscale_factor}x)")
+
+    return result_img
+
+
+def run_2nd_pass(
+    image: Image.Image,
+    prompt: str,
+    strength: float,
+    num_steps: int,
+    guidance_scale: float,
+    shift: float,
+    generator: torch.Generator,
+    lora_path_loaded: str,
+    lora_scale: float,
+) -> Image.Image:
+    """
+    Low-denoise img2img 2nd pass using the already-loaded Flux2KleinPipeline.
+
+    Equivalent to a ComfyUI KSampler pass with denoise=strength.
+    The same LoRA (if loaded) stays active, preserving subject identity while
+    adding fine skin texture, pore detail, and micro-contrast.
+
+    Args:
+        image: Output from the 1st generation pass (PIL RGB).
+        prompt: Same prompt used for the 1st pass.
+        strength: Fraction of steps to apply (0.05–0.95). 0.3 recommended —
+                  adds detail without drifting from the original composition.
+        num_steps: Total inference steps for this pass (actual steps applied =
+                   num_steps × strength, matching the diffusers convention).
+        guidance_scale: Classifier-free guidance scale (match 1st pass).
+        shift: Flow-matching shift value (match 1st pass).
+        generator: Seeded RNG for reproducibility.
+        lora_path_loaded: Name of the loaded LoRA adapter (empty if none).
+        lora_scale: LoRA adapter weight to apply.
+
+    Returns:
+        Refined PIL Image.
+    """
+    global pipeline
+
+    print(
+        f"2nd pass detailer: strength={strength}, steps={num_steps}, "
+        f"guidance={guidance_scale}, shift={shift}"
+    )
+
+    # Re-apply scheduler shift (same value as 1st pass; cheap operation)
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipeline.scheduler.config,
+        shift=shift,
+    )
+
+    if lora_path_loaded:
+        pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
+
+    start = time.time()
+    with torch.inference_mode():
+        result = pipeline(
+            prompt=prompt,
+            image=image,
+            strength=strength,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+        )
+    print(f"2nd pass complete in {time.time() - start:.2f}s")
+    return result.images[0]
 
 
 def load_lora_weights(
@@ -608,13 +903,40 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
 
     generation_time = time.time() - start_time
 
+    # -------------------------------------------------------------------------
+    # Post-processing: 2nd pass detailer and/or tiled upscale
+    # -------------------------------------------------------------------------
+    enable_2nd_pass = job_input.get("enable_2nd_pass", False)
+    second_pass_strength = job_input.get("second_pass_strength", 0.3)
+    second_pass_steps = job_input.get("second_pass_steps", 20)
+    enable_upscale = job_input.get("enable_upscale", False)
+    upscale_factor = job_input.get("upscale_factor", 2.0)
+
+    processed_images = []
+    for img in result.images:
+        if enable_2nd_pass:
+            img = run_2nd_pass(
+                image=img,
+                prompt=prompt,
+                strength=second_pass_strength,
+                num_steps=second_pass_steps,
+                guidance_scale=guidance_scale,
+                shift=shift,
+                generator=generator,
+                lora_path_loaded=lora_path_loaded,
+                lora_scale=current_lora_scale,
+            )
+        if enable_upscale:
+            img = tiled_upscale(img, upscale_factor=upscale_factor)
+        processed_images.append(img)
+
     # Process output images
     return_type = job_input.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
-    
+
     if return_type == "s3":
         # Upload to S3 and return presigned URLs
         image_urls = []
-        for img in result.images:
+        for img in processed_images:
             url = upload_to_s3(img, output_format)
             if url:
                 image_urls.append(url)
@@ -635,6 +957,11 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "seed": seed,
                 "num_images": num_images,
                 "shift": shift,
+                "enable_2nd_pass": enable_2nd_pass,
+                "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
+                "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
+                "enable_upscale": enable_upscale,
+                "upscale_factor": upscale_factor if enable_upscale else None,
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
@@ -649,7 +976,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     else:
         # Return base64 encoded images
         images_base64 = []
-        for img in result.images:
+        for img in processed_images:
             images_base64.append(encode_image_to_base64(img, output_format))
 
         response = {
@@ -665,6 +992,11 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "seed": seed,
                 "num_images": num_images,
                 "shift": shift,
+                "enable_2nd_pass": enable_2nd_pass,
+                "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
+                "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
+                "enable_upscale": enable_upscale,
+                "upscale_factor": upscale_factor if enable_upscale else None,
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
