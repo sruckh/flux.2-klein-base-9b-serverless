@@ -20,10 +20,12 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
 - **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture
 - **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
+- **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement — equivalent to a ComfyUI KSampler detailer pass
+- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 512px tiles; resizes to target factor (e.g. 2× output from a 4× SR pass)
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
-- **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts
+- **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts; upscaler model auto-downloaded and cached on first use
 - **High-Performance Downloads** - Xet storage backend with concurrent chunk downloads
 
 ## 🏗️ Architecture
@@ -37,7 +39,9 @@ The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscret
 3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
-6. **Post-Processing** — Images uploaded to S3 (presigned URL) or encoded to base64
+6. **2nd Pass Detailer** *(optional)* — Low-denoise img2img pass on the same pipeline with `strength=0.3`; adds fine skin texture and micro-contrast without drifting from the original composition; LoRA stays active for subject consistency
+7. **Tiled Upscale** *(optional)* — DRCT-L 4× SR via spandrel with 512px/32px feather-blended tiles; result resized to `upscale_factor` via LANCZOS; model auto-downloaded to `/runpod-volume/models/` on first use
+8. **Output** — Images uploaded to S3 (presigned URL) or encoded to base64
 
 ## 🚀 Quick Start
 
@@ -161,7 +165,12 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
     "guidance_scale": 2.0,
     "shift": 1.5,
     "seed": 42,
-    "return_type": "s3"
+    "return_type": "s3",
+    "enable_2nd_pass": true,
+    "second_pass_strength": 0.3,
+    "second_pass_steps": 20,
+    "enable_upscale": true,
+    "upscale_factor": 2.0
   }
 }
 ```
@@ -215,6 +224,11 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
 | `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9 |
+| `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass after generation |
+| `second_pass_strength` | float | `0.3` | Detailer denoise strength (0.05–0.95); 0.3 adds skin/pore detail without composition drift |
+| `second_pass_steps` | int | `20` | Inference steps for the 2nd pass (5–50); actual steps applied = `steps × strength` |
+| `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution upscaling |
+| `upscale_factor` | float | `2.0` | Target upscale multiplier (0.25–4.0); model runs at 4×, result resized to this factor |
 
 ### Configuration
 
@@ -227,6 +241,7 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `DTYPE` | `float8_e4m3fn` | Compute dtype — triggers INT8 quantization of transformer via optimum-quanto |
 | `ENABLE_CPU_OFFLOAD` | `false` | Use CPU offload instead of full VRAM placement |
 | `HF_TOKEN` | `""` | **Required** — FLUX.2-klein-base-9B is a gated model |
+| `UPSCALER_MODEL_PATH` | `/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth` | Path to DRCT-L upscaler model; auto-downloaded from GitHub on first use |
 
 ### S3 Configuration (Optional)
 
@@ -258,9 +273,13 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 |---------------|------|-------|
 | BF16, no offload | ~22–24 GB | Best quality; H100/A100 80GB |
 | INT8 quantized (default) | ~14–16 GB | Good quality; RTX 4090 (24 GB), A100 40 GB |
+| INT8 + 2nd pass | ~14–16 GB | Same pipeline reused — zero additional VRAM |
+| INT8 + upscaler | ~14–16 GB + ~300 MB | DRCT-L loaded alongside; tiled inference keeps per-tile VRAM trivial |
 | BF16 + CPU offload | ~12–14 GB | Slower; set `ENABLE_CPU_OFFLOAD=true` |
 
 The default `DTYPE=float8_e4m3fn` triggers INT8 quantization of the transformer via optimum-quanto, reducing transformer VRAM from ~18 GB to ~9 GB while keeping text encoders and VAE at BF16.
+
+The 2nd pass detailer reuses the already-loaded `Flux2KleinPipeline` with an `image` + `strength` parameter — no second model is loaded, so VRAM usage is identical to a standard generation request. The DRCT-L upscaler (~300 MB) is loaded separately via spandrel and cached globally after first use; tiled inference keeps peak per-tile GPU memory negligible.
 
 ## 🎨 Training Custom LoRAs
 
