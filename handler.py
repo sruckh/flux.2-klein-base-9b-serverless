@@ -679,15 +679,9 @@ def run_2nd_pass(
     )
     noisy_latent = (1.0 - start_sigma) * clean_latent + start_sigma * noise
 
-    # --- Pack into FLUX's patch-sequence format ---
-    # VAE latent: (B, C, H_lat, W_lat) — FLUX uses 2×2 spatial patches
-    # Packed:     (B, H_lat/2 · W_lat/2, C·4)
-    bsz, nc, lat_h, lat_w = noisy_latent.shape
-    ph, pw = lat_h // 2, lat_w // 2
-    packed = noisy_latent.view(bsz, nc, ph, 2, pw, 2)
-    packed = packed.permute(0, 2, 4, 1, 3, 5).reshape(bsz, ph * pw, nc * 4)
-
     # --- Denoise from our partial-noise starting point ---
+    # Pass noisy_latent as 4D (B, C, H_lat, W_lat); the pipeline's prepare_latents
+    # / _prepare_latent_ids handles packing into patch-sequence format internally.
     t0 = time.time()
     with torch.inference_mode():
         result = pipeline(
@@ -697,7 +691,7 @@ def run_2nd_pass(
             num_inference_steps=actual_steps,
             guidance_scale=guidance_scale,
             generator=generator,
-            latents=packed,
+            latents=noisy_latent,
             sigmas=custom_sigmas,
         )
     print(f"2nd pass complete in {time.time() - t0:.2f}s")
