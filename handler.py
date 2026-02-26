@@ -679,6 +679,12 @@ def run_2nd_pass(
     )
     noisy_latent = (1.0 - start_sigma) * clean_latent + start_sigma * noise
 
+    # --- Debug: log shapes to diagnose any format mismatch ---
+    print(f"  [dbg] image.size (PIL w,h)={image.size}")
+    print(f"  [dbg] noisy_latent.shape={noisy_latent.shape}  dtype={noisy_latent.dtype}")
+    print(f"  [dbg] transformer.in_channels={pipeline.transformer.config.in_channels}")
+    print(f"  [dbg] vae_scale_factor={vae_scale_factor}  vae.config.latent_channels={getattr(vae.config, 'latent_channels', 'N/A')}")
+
     # --- Denoise from our partial-noise starting point ---
     # Pass noisy_latent as 4D (B, C, H_lat, W_lat); the pipeline's prepare_latents
     # / _prepare_latent_ids handles packing into patch-sequence format internally.
