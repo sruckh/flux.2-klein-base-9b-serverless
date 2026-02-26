@@ -5,11 +5,11 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8.0-orange)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-> A production-ready RunPod serverless deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support.
+> A production-ready RunPod serverless deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support, tuned for photorealistic human portraits.
 
 This serverless API generates high-quality images using the **FLUX.2-klein-base-9B** base model via `Flux2KleinPipeline`, with support for custom LoRA weights loaded from HTTPS URLs, HuggingFace Hub, or local paths. Output is delivered via S3 presigned URLs or base64.
 
-> **Important:** This uses the **base (undistilled)** model. Use 25–50 inference steps and guidance scale 3.5–5.0. Do not use 4–8 steps or guidance 1.0 — those settings are for the distilled variant.
+> **Important:** This uses the **base (undistilled)** model. Use 35–50 inference steps and guidance scale 2.0–3.0. Do **not** use 4–8 steps or guidance 1.0 — those settings are for the distilled variant. Do **not** use guidance 4.0+ — it produces over-rendered, plastic-looking skin.
 
 ## ✨ Features
 
@@ -17,8 +17,9 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **Flux2KleinPipeline** - Correct pipeline class via git diffusers (not available in stable releases)
 - **Custom LoRA Support** - Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
 - **LoRA Hot-Swap** - Switch LoRA between requests without reloading the base model
-- **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 3.0)
-- **Optimized Presets** - BFL-aligned settings for realistic characters, portraits, and more
+- **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
+- **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture
+- **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
@@ -27,14 +28,12 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 
 ## 🏗️ Architecture
 
-![Data Flow Diagram](./docs/diagrams/data-flow.svg)
-
-The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization.
+The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization.
 
 ### Data Flow Pipeline
 
 1. **Input Validation** — Parameters validated against schema, preset defaults applied
-2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + `.to("cuda")`; scheduler initialized with `shift=3.0`; VAE slicing/tiling enabled
+2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + INT8 quantization + `.to("cuda")`; scheduler initialized with `shift=1.5`; VAE slicing/tiling enabled
 3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
@@ -46,7 +45,7 @@ The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscret
 
 - **Docker** - For containerized deployment
 - **RunPod Account** - For serverless GPU deployment
-- **NVIDIA GPU** - H100 or A100 80GB recommended (model needs ~22–24 GB VRAM at BF16)
+- **NVIDIA GPU** - H100 or A100 80GB recommended; RTX 4090 (24 GB) works with INT8 quantization
 - **HuggingFace Token** - Required (FLUX.2-klein-base-9B is a gated model)
 
 ### Installation
@@ -98,53 +97,56 @@ git push -u origin main
 
 ### Optimized Presets
 
-Presets aligned with BFL documentation for the base (undistilled) model:
+All presets are tuned for photorealistic human character output. Lower guidance and shift produce natural skin texture; higher values produce more stylised or structured results.
 
-| Preset | Steps | Guidance | Resolution | Shift | Best For |
-|--------|-------|----------|------------|-------|----------|
-| `realistic_character` | 30 | 4.0 | 1024×1024 | 3.0 | **Ultra-realistic human LoRAs** (default) |
-| `portrait_hd` | 30 | 4.0 | 1024×1536 | 3.0 | High-detail vertical portraits |
-| `cinematic_full` | 30 | 4.5 | 1536×1024 | 3.0 | Full-body cinematic compositions |
-| `fast_preview` | 25 | 3.5 | 1024×1024 | 3.0 | Quick prompt testing |
-| `maximum_quality` | 50 | 5.0 | 1024×1024 | 3.0 | Highest quality final output |
+| Preset | Steps | Guidance | Shift | Resolution | Best For |
+|--------|-------|----------|-------|------------|----------|
+| `realistic_character` | 35 | 2.0 | 1.5 | 1024×1024 | **Photorealistic human LoRAs** (default) |
+| `portrait_hd` | 40 | 2.0 | 1.5 | 1024×1536 | High-detail vertical portraits |
+| `cinematic_full` | 35 | 2.5 | 1.5 | 1536×1024 | Full-body cinematic compositions |
+| `fast_preview` | 20 | 2.0 | 1.5 | 1024×1024 | Quick prompt/seed testing |
+| `maximum_quality` | 50 | 2.5 | 1.0 | 1024×1024 | Highest quality final output |
 
 ### Realistic Character Best Practices
 
 > **This is the base (undistilled) model.** Do not use distilled model settings.
 
 **Optimal Inference Settings:**
-- **Steps:** 25–50 (sweet spot: 28–30 for quality/speed balance)
-- **Guidance:** 3.5–5.0 — BFL default is 4.0; match your AI-Toolkit training YAML `sample.guidance`
-- **Scheduler Shift:** 3.0 for character LoRAs; tune 1.0–7.0 (higher = better large-structure coherence)
+- **Steps:** 35–50 (sweet spot: 35–40 for quality/speed balance)
+- **Guidance:** 2.0–2.5 — lower = more organic, natural-looking skin; higher = more stylised
+- **Scheduler Shift:** 1.0–1.5 for photorealism; lower = more denoising budget on fine-detail timesteps (pores, texture, natural imperfection)
 - **Resolution:** 1024×1024 standard, 1024×1536 for portraits (match your training preview size)
-- **LoRA Scale:** 0.7–1.0 — start from your training YAML `sample.lora_weight` (typically 0.85); avoid >1.0
+- **LoRA Scale:** 0.7–0.9 — start at 0.85; avoid 1.0+ (pushes identity too hard, reduces naturalness)
 
 **Trigger Word:** Include your LoRA trigger word first in the prompt (AI-Toolkit convention).
 
 **Prompt Structure:**
 ```
-[TRIGGER] [subject description], [clothing/environment], [lighting], [camera/lens], photorealistic
+[TRIGGER] [subject description], [clothing/environment], [lighting], [camera/lens], [film language]
 ```
 
 Example:
 ```
 TOK woman, close-up portrait, soft window light from the left, slight smile,
-out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photorealistic
+out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8,
+natural skin, visible pores, unretouched, ISO 800, slight film grain
 ```
 
 **Prompting Notes:**
 - FLUX.2-klein uses Qwen3-8B as text encoder — it handles long, descriptive prompts well
-- Avoid SDXL boilerplate ("masterpiece, best quality") — this is a flow transformer, not SD1.5
-- Leave `negative_prompt` empty or use it sparingly — base model has limited negative prompt support
+- Avoid SDXL boilerplate ("masterpiece, best quality", "photorealistic, highly detailed skin texture") — these keywords are associated with over-processed, retouched aesthetics
+- Use camera/film language instead: "ISO 800", "slight film grain", "unretouched", "candid" — these anchor the model to real photography priors
+- FLUX.2-klein does **not** support `negative_prompt` — it is ignored
 
 ### Scheduler Shift Reference
 
 | Shift | Effect |
 |-------|--------|
-| `1.0` | Linear default; flat noise distribution |
-| `3.0` | **Recommended for character LoRAs**; better face/skin coherence |
-| `5.0` | More time at high-noise timesteps; helps complex lighting |
-| `7.0` | Maximum structure emphasis; useful for multi-figure scenes |
+| `1.0` | Maximum fine-detail budget; most natural skin/texture; best for close-up portraits |
+| `1.5` | **Default for photorealistic character LoRAs**; natural texture with good structure |
+| `2.0` | Balanced; slightly stronger large-structure coherence |
+| `3.0` | Better face/structure coherence; may smooth skin texture |
+| `5.0` | Strong structure emphasis; helps complex lighting or multi-figure scenes |
 
 ### API Reference
 
@@ -152,12 +154,12 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
 ```json
 {
   "input": {
-    "prompt": "TOK woman, close-up portrait, soft window light, Sony A7IV, 105mm f/2.8, photorealistic",
-    "preset": "realistic_character",
+    "prompt": "TOK woman, close-up portrait, soft window light, Sony A7IV, 105mm f/2.8, natural skin, visible pores, unretouched, ISO 800",
+    "preset": "portrait_hd",
     "lora_path": "https://example.com/your-character-lora.safetensors",
     "lora_scale": 0.85,
-    "guidance_scale": 4.0,
-    "shift": 3.0,
+    "guidance_scale": 2.0,
+    "shift": 1.5,
     "seed": 42,
     "return_type": "s3"
   }
@@ -170,11 +172,11 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
   "image_urls": ["https://s3.amazonaws.com/bucket/flux2-klein/uuid.jpg?X-Amz-Algorithm=..."],
   "format": "jpeg",
   "return_type": "s3",
-  "parameters": { "width": 1024, "height": 1024, "num_inference_steps": 30, "guidance_scale": 4.0, "shift": 3.0, "seed": 42 },
+  "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
-    "preset": "realistic_character",
+    "preset": "portrait_hd",
     "s3_bucket": "your-bucket-name",
     "presigned_url_expiry_seconds": 3600
   }
@@ -187,11 +189,11 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
   "images": ["<base64_encoded_image>"],
   "format": "jpeg",
   "return_type": "base64",
-  "parameters": { "width": 1024, "height": 1024, "num_inference_steps": 30, "guidance_scale": 4.0, "shift": 3.0, "seed": 42 },
+  "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
     "generation_time": "12.34s",
-    "preset": "realistic_character"
+    "preset": "portrait_hd"
   }
 }
 ```
@@ -202,19 +204,17 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
 |-----------|------|---------|-------------|
 | `prompt` | string | *required* | Text prompt — include trigger word first |
 | `preset` | string | `realistic_character` | Quality preset (see table above) |
-| `negative_prompt` | string | `""` | Negative prompt (limited effect on base model) |
 | `width` | int | `1024` | Image width (multiple of 16) |
 | `height` | int | `1024` | Image height (multiple of 16) |
-| `num_inference_steps` | int | `30` | Denoising steps — use 25–50 for base model |
-| `guidance_scale` | float | `4.0` | CFG scale — use 3.5–5.0; match training YAML `sample.guidance` |
-| `shift` | float | `3.0` | Scheduler shift — 3.0 for character LoRAs; tune 1.0–7.0 |
+| `num_inference_steps` | int | `35` | Denoising steps — use 35–50 for base model |
+| `guidance_scale` | float | `2.0` | CFG scale — 2.0–2.5 for photorealism; higher = more stylised |
+| `shift` | float | `1.5` | Scheduler shift — 1.0–1.5 for natural skin texture; higher for structure |
 | `seed` | int | `-1` | Random seed (-1 for random) |
 | `num_images` | int | `1` | Number of images per request (1–4) |
 | `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
-| `max_sequence_length` | int | `512` | Text encoder max sequence length |
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
-| `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); match training YAML `sample.lora_weight` |
+| `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9 |
 
 ### Configuration
 
@@ -224,7 +224,8 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
 | `DEFAULT_LORA_PATH` | `""` | Default LoRA loaded at worker startup |
 | `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA weight scale |
 | `DEVICE` | `cuda` | Compute device |
-| `DTYPE` | `bf16` | Compute dtype: `bf16`, `float16`, `float32` |
+| `DTYPE` | `float8_e4m3fn` | Compute dtype — triggers INT8 quantization of transformer via optimum-quanto |
+| `ENABLE_CPU_OFFLOAD` | `false` | Use CPU offload instead of full VRAM placement |
 | `HF_TOKEN` | `""` | **Required** — FLUX.2-klein-base-9B is a gated model |
 
 ### S3 Configuration (Optional)
@@ -256,9 +257,10 @@ out-of-focus office interior background, shot on Sony A7IV, 105mm f/2.8, photore
 | Configuration | VRAM | Notes |
 |---------------|------|-------|
 | BF16, no offload | ~22–24 GB | Best quality; H100/A100 80GB |
-| BF16 + CPU offload | ~12–14 GB | Slower; 3090/4080 |
+| INT8 quantized (default) | ~14–16 GB | Good quality; RTX 4090 (24 GB), A100 40 GB |
+| BF16 + CPU offload | ~12–14 GB | Slower; set `ENABLE_CPU_OFFLOAD=true` |
 
-This deployment targets H100/A100 80GB with full VRAM placement (no CPU offload).
+The default `DTYPE=float8_e4m3fn` triggers INT8 quantization of the transformer via optimum-quanto, reducing transformer VRAM from ~18 GB to ~9 GB while keeping text encoders and VAE at BF16.
 
 ## 🎨 Training Custom LoRAs
 
@@ -278,7 +280,7 @@ python flux_train_ui.py
 - **Weight Decay:** 0.00001
 - **Dataset:** 20–40 images with diverse angles, expressions, and lighting
 
-**Training → Inference Alignment:** Set `guidance_scale`, `num_inference_steps`, and `lora_scale` to match your AI-Toolkit training YAML's `sample.guidance`, `sample.sample_steps`, and `sample.lora_weight` respectively. Mismatching these is the most common cause of inference not matching training previews.
+**Training → Inference Alignment:** Match `num_inference_steps` and `lora_scale` to your AI-Toolkit training YAML's `sample.sample_steps` and `sample.lora_weight`. For `guidance_scale`, start at 2.0 regardless of training YAML value — the training guidance is for the distilled sampler and does not translate directly.
 
 ## 📄 License
 
