@@ -32,6 +32,8 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 
 The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization.
 
+**FLUX.2-klein latent format:** The VAE uses **32 latent channels** (vs 16 in FLUX.1). The pipeline's internal latent representation is `(B, 128, H/16, W/16)` — a space-to-depth folding of the VAE output where 2×2 spatial blocks are folded into the channel dimension (`pixel_unshuffle(r=2)`), then flat-reshaped to a token sequence `(B, seq, 128)` for the transformer.
+
 ### Data Flow Pipeline
 
 1. **Input Validation** — Parameters validated against schema, preset defaults applied
@@ -39,7 +41,7 @@ The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscret
 3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
-6. **2nd Pass Detailer** *(optional)* — Low-denoise img2img pass on the same pipeline with `strength=0.3`; adds fine skin texture and micro-contrast without drifting from the original composition; LoRA stays active for subject consistency
+6. **2nd Pass Detailer** *(optional)* — `Flux2KleinPipeline` is text-to-image only (no native img2img). The detailer is implemented manually: VAE-encode the 1st pass output → inject flow-matching noise at `start_sigma` corresponding to `strength` (`x_t = (1−σ)·x_clean + σ·noise`) → convert to pipeline's internal latent format via `pixel_unshuffle(r=2)` → call pipeline with pre-computed noisy latents + partial sigma schedule; LoRA stays active for subject consistency
 7. **Tiled Upscale** *(optional)* — DRCT-L 4× SR via spandrel with 512px/32px feather-blended tiles; result resized to `upscale_factor` via LANCZOS; model auto-downloaded to `/runpod-volume/models/` on first use
 8. **Output** — Images uploaded to S3 (presigned URL) or encoded to base64
 

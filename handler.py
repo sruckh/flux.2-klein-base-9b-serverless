@@ -308,6 +308,13 @@ INPUT_SCHEMA = {
         "default": 20,
         "constraints": lambda x: 5 <= x <= 50,
     },
+    "second_pass_guidance_scale": {
+        "type": float,
+        "required": False,
+        "default": 1.0,  # Much lower than 1st pass — high CFG on a near-clean latent
+        # causes over-saturation and plastic/cartoon look. 1.0–1.3 recommended.
+        "constraints": lambda x: 0.1 <= x <= 5.0,
+    },
     # -------------------------------------------------------------------------
     # Tiled Upscaler (DRCT-L 4x → resize to target factor)
     # -------------------------------------------------------------------------
@@ -614,7 +621,10 @@ def run_2nd_pass(
         strength: Fraction of sigma schedule to run (0.05–0.95).
                   0.3 recommended — adds detail without composition drift.
         num_steps: Reference step count; actual denoising steps ≈ steps × strength.
-        guidance_scale: Classifier-free guidance scale (match 1st pass).
+        guidance_scale: CFG scale for the 2nd pass. Should be MUCH lower than the
+                        1st pass (1.0–1.3 recommended). High CFG on a near-clean
+                        latent causes over-saturation and a plastic/cartoon look
+                        because the model over-amplifies style signals at every step.
         shift: Flow-matching shift value (match 1st pass).
         generator: Seeded RNG — reused for noise reproducibility.
         lora_path_loaded: Loaded LoRA adapter name (empty if none).
@@ -689,13 +699,18 @@ def run_2nd_pass(
     noisy_latent_packed = torch.nn.functional.pixel_unshuffle(noisy_latent, downscale_factor=2)
 
     # --- Denoise from our partial-noise starting point ---
+    # NOTE: do NOT pass num_inference_steps alongside sigmas.
+    # If the pipeline's __call__ calls scheduler.set_timesteps(num_inference_steps)
+    # before checking sigmas, it builds a fresh full schedule from σ_max→0 and
+    # overrides our custom partial schedule — the pipeline then treats our lightly-
+    # noised latent as if it were near-pure noise, producing a completely different
+    # style. Passing only sigmas lets the pipeline/scheduler use our slice directly.
     t0 = time.time()
     with torch.inference_mode():
         result = pipeline(
             prompt=prompt,
             height=h,
             width=w,
-            num_inference_steps=actual_steps,
             guidance_scale=guidance_scale,
             generator=generator,
             latents=noisy_latent_packed,
@@ -971,6 +986,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     enable_2nd_pass = job_input.get("enable_2nd_pass", False)
     second_pass_strength = job_input.get("second_pass_strength", 0.3)
     second_pass_steps = job_input.get("second_pass_steps", 20)
+    second_pass_guidance_scale = job_input.get("second_pass_guidance_scale", 1.0)
     enable_upscale = job_input.get("enable_upscale", False)
     upscale_factor = job_input.get("upscale_factor", 2.0)
 
@@ -982,7 +998,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 prompt=prompt,
                 strength=second_pass_strength,
                 num_steps=second_pass_steps,
-                guidance_scale=guidance_scale,
+                guidance_scale=second_pass_guidance_scale,
                 shift=shift,
                 generator=generator,
                 lora_path_loaded=lora_path_loaded,
@@ -1022,6 +1038,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "enable_2nd_pass": enable_2nd_pass,
                 "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
                 "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
+                "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
             },
@@ -1057,6 +1074,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "enable_2nd_pass": enable_2nd_pass,
                 "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
                 "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
+                "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
             },
