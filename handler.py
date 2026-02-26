@@ -122,8 +122,8 @@ PRESETS = {
     # texture and lighting rather than hyper-stylised structure.
     "realistic_character": {
         "num_inference_steps": 35,
-        "guidance_scale": 2.5,
-        "shift": 2.0,
+        "guidance_scale": 2.0,
+        "shift": 1.5,
         "width": 1024,
         "height": 1024,
         "description": "Photorealistic human portrait — square crop"
@@ -133,8 +133,8 @@ PRESETS = {
     # Slightly more steps for the extra pixel budget.
     "portrait_hd": {
         "num_inference_steps": 40,
-        "guidance_scale": 2.5,
-        "shift": 2.0,
+        "guidance_scale": 2.0,
+        "shift": 1.5,
         "width": 1024,
         "height": 1536,
         "description": "Photorealistic portrait — 2:3 vertical crop"
@@ -143,8 +143,8 @@ PRESETS = {
     # Full-body or environmental shot in cinematic 3:2 ratio.
     "cinematic_full": {
         "num_inference_steps": 35,
-        "guidance_scale": 3.0,
-        "shift": 2.0,
+        "guidance_scale": 2.5,
+        "shift": 1.5,
         "width": 1536,
         "height": 1024,
         "description": "Cinematic full-body or environment shot — 3:2 horizontal"
@@ -153,8 +153,8 @@ PRESETS = {
     # Fast iteration for prompt / seed testing — not for final output.
     "fast_preview": {
         "num_inference_steps": 20,
-        "guidance_scale": 2.5,
-        "shift": 2.0,
+        "guidance_scale": 2.0,
+        "shift": 1.5,
         "width": 1024,
         "height": 1024,
         "description": "Quick preview for prompt and seed exploration"
@@ -163,8 +163,8 @@ PRESETS = {
     # Highest quality — use for hero shots where generation time is acceptable.
     "maximum_quality": {
         "num_inference_steps": 50,
-        "guidance_scale": 3.0,
-        "shift": 1.5,
+        "guidance_scale": 2.5,
+        "shift": 1.0,
         "width": 1024,
         "height": 1024,
         "description": "Maximum quality — slowest, most detail"
@@ -465,7 +465,7 @@ def initialize_pipeline(
     # Overridden per-request in generate_images(); this value only affects warmup.
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipeline.scheduler.config,
-        shift=2.0,
+        shift=1.5,
     )
 
     # VAE memory optimizations
@@ -547,8 +547,8 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
         width = 1024
         height = 1024
         num_inference_steps = 35
-        guidance_scale = 2.5
-        shift = 2.0
+        guidance_scale = 2.0
+        shift = 1.5
 
     # Override with explicit values if provided
     prompt = job_input["prompt"]

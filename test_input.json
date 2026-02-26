@@ -1,6 +1,6 @@
 {
   "input": {
-    "prompt": "a professional portrait photograph of TOK, a young woman with shoulder-length auburn hair and hazel eyes, wearing a casual white blouse, standing on a city street during golden hour, soft natural lighting, shallow depth of field, shot on Sony A7IV, 85mm lens, f/1.8, photorealistic, highly detailed skin texture",
+    "prompt": "candid portrait photo of TOK, auburn shoulder-length hair, hazel eyes, white blouse, standing on a city street, golden hour backlight, 85mm f/1.8 bokeh, Sony A7IV, ISO 800, natural skin, visible pores, unretouched, slight film grain, raw photography",
     "preset": "portrait_hd",
     "seed": 42,
     "num_images": 1,
