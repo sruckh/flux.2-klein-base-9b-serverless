@@ -634,8 +634,10 @@ def run_2nd_pass(
     )
 
     # --- Scheduler (same config as 1st pass) ---
+    # use_dynamic_shifting=False: shift is already pre-computed; disabling dynamic
+    # shifting means set_timesteps() won't require `mu` and will use `shift` directly.
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipeline.scheduler.config, shift=shift,
+        pipeline.scheduler.config, shift=shift, use_dynamic_shifting=False,
     )
     if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
