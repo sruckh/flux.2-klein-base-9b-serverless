@@ -35,7 +35,7 @@ import torch
 from botocore.exceptions import ClientError
 from diffusers import Flux2KleinPipeline
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from PIL import Image
+from PIL import Image, ImageFilter
 
 
 # RunPod serverless SDK
@@ -299,13 +299,15 @@ INPUT_SCHEMA = {
     "second_pass_strength": {
         "type": float,
         "required": False,
-        "default": 0.3,  # 0.3 ≈ ComfyUI 0.3 denoise KSampler pass; keeps subject intact
-        "constraints": lambda x: 0.05 <= x <= 0.95,
+        # Blend factor for how much 2nd-pass micro-detail to transfer back
+        # onto the 1st pass image. 0.2 is intentionally conservative.
+        "default": 0.2,
+        "constraints": lambda x: 0.0 <= x <= 1.0,
     },
     "second_pass_steps": {
         "type": int,
         "required": False,
-        "default": 20,
+        "default": 12,
         "constraints": lambda x: 5 <= x <= 50,
     },
     "second_pass_guidance_scale": {
@@ -328,6 +330,13 @@ INPUT_SCHEMA = {
         "required": False,
         "default": 2.0,  # 2.0 = 4x DRCT then resize to 2x (2048×2048 from 1024×1024)
         "constraints": lambda x: 0.25 <= x <= 4.0,
+    },
+    "upscale_blend": {
+        "type": float,
+        "required": False,
+        # 0.35 keeps identity/composition from the source while adding detail.
+        "default": 0.35,
+        "constraints": lambda x: 0.0 <= x <= 1.0,
     },
 }
 
@@ -468,6 +477,7 @@ def load_upscaler():
 def tiled_upscale(
     image: Image.Image,
     upscale_factor: float = 2.0,
+    upscale_blend: float = 0.35,
     tile_size: int = UPSCALE_TILE_SIZE,
     overlap: int = UPSCALE_TILE_OVERLAP,
 ) -> Image.Image:
@@ -482,12 +492,15 @@ def tiled_upscale(
         4. Accumulate patches into output buffer using a linear-ramp weight
            kernel (feathering) to blend seams
         5. Divide by accumulated weight → final image
-        6. If upscale_factor < 4.0, resize down with LANCZOS
+        6. Resize to requested factor with LANCZOS
+        7. Optionally blend with plain LANCZOS upscale to reduce hallucinations
 
     Args:
         image: Input PIL Image (RGB).
         upscale_factor: Target output scale relative to input (0.25–4.0).
                         DRCT-L always runs at 4x; result is resized if needed.
+        upscale_blend: Blend amount of AI upscale over plain LANCZOS upscale.
+                       0.0 = pure LANCZOS, 1.0 = full AI output.
         tile_size: Tile edge length in input pixels (default 512).
         overlap: Overlap between adjacent tiles in input pixels (default 32).
 
@@ -496,6 +509,7 @@ def tiled_upscale(
     """
     model = load_upscaler()
     model_scale = model.scale  # 4 for DRCT-L
+    upscale_blend = float(max(0.0, min(1.0, upscale_blend)))
 
     img_np = np.array(image.convert("RGB")).astype(np.float32) / 255.0
     # HWC → CHW → NCHW (kept on CPU until each tile is dispatched to GPU)
@@ -576,14 +590,56 @@ def tiled_upscale(
     out_np = (output.squeeze(0).permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     result_img = Image.fromarray(out_np, "RGB")
 
-    # If target factor differs from the model's native 4x, resize to requested size
-    if abs(upscale_factor - model_scale) > 0.01:
-        target_w = int(round(in_w * upscale_factor))
-        target_h = int(round(in_h * upscale_factor))
+    target_w = int(round(in_w * upscale_factor))
+    target_h = int(round(in_h * upscale_factor))
+
+    # Resize native 4x output to requested scale (including non-4x factors)
+    if (target_w, target_h) != (out_w, out_h):
         result_img = result_img.resize((target_w, target_h), Image.LANCZOS)
         print(f"Resized 4x output → {target_w}x{target_h} ({upscale_factor}x)")
 
+    # Conservative merge: preserve global composition/color from source image.
+    # This avoids the "different generation" look while still adding texture.
+    if upscale_blend < 1.0:
+        base_resized = image.convert("RGB").resize((target_w, target_h), Image.LANCZOS)
+        result_img = Image.blend(base_resized, result_img, alpha=upscale_blend)
+        print(f"Applied upscale blend: {upscale_blend:.2f}")
+
     return result_img
+
+
+def _transfer_high_frequency_details(
+    base_image: Image.Image,
+    refined_image: Image.Image,
+    amount: float,
+    blur_radius: float = 1.25,
+) -> Image.Image:
+    """
+    Transfer only micro-detail from refined_image onto base_image.
+
+    This keeps identity, framing, color balance, and overall style from the
+    first pass while adding texture from a second generative pass.
+    """
+    amount = float(max(0.0, min(1.0, amount)))
+    if amount <= 0.0:
+        return base_image
+
+    base_rgb = base_image.convert("RGB")
+    refined_rgb = refined_image.convert("RGB")
+
+    base_np = np.asarray(base_rgb, dtype=np.float32)
+    refined_np = np.asarray(refined_rgb, dtype=np.float32)
+
+    # High-frequency band from each image via Gaussian low-pass subtraction.
+    base_low = np.asarray(base_rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32)
+    refined_low = np.asarray(refined_rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32)
+    base_high = base_np - base_low
+    refined_high = refined_np - refined_low
+
+    # Inject only incremental detail differences from refined into base.
+    mixed = base_np + amount * (refined_high - base_high)
+    mixed = np.clip(mixed, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(mixed, "RGB")
 
 
 def run_2nd_pass(
@@ -598,35 +654,21 @@ def run_2nd_pass(
     lora_scale: float,
 ) -> Image.Image:
     """
-    Low-denoise img2img 2nd pass via manual VAE encode + partial noise injection.
+    Conservative 2nd-pass detailer using FLUX2 image conditioning.
 
-    Flux2KleinPipeline is text-to-image only and does not accept `image` or
-    `strength` parameters. This function implements img2img manually:
-
-      1. Encodes the input PIL image to clean VAE latents
-      2. Adds flow-matching noise at the sigma level corresponding to `strength`
-         using the interpolation:  x_t = (1−σ) · x_clean + σ · noise
-      3. Packs latents into FLUX's 2×2 patch-sequence format
-      4. Calls the existing pipeline with those pre-noised latents and a custom
-         sigma schedule that starts at our chosen noise level — skipping the
-         fully-noisy portion of the schedule entirely
-
-    This is exactly equivalent to a ComfyUI KSampler detailer pass with
-    denoise=strength. The loaded LoRA stays active, preserving subject identity
-    while adding fine skin texture, pore detail, and micro-contrast.
+    Flux2KleinPipeline accepts an `image` conditioning input but does not expose
+    a native img2img `strength` parameter. To avoid large style/composition drift:
+      1. Run a short, low-guidance conditioned pass.
+      2. Transfer only high-frequency detail from that result back to pass-1.
 
     Args:
         image: Output from the 1st generation pass (PIL RGB).
         prompt: Same prompt used for the 1st pass.
-        strength: Fraction of sigma schedule to run (0.05–0.95).
-                  0.3 recommended — adds detail without composition drift.
-        num_steps: Reference step count; actual denoising steps ≈ steps × strength.
-        guidance_scale: CFG scale for the 2nd pass. Should be MUCH lower than the
-                        1st pass (1.0–1.3 recommended). High CFG on a near-clean
-                        latent causes over-saturation and a plastic/cartoon look
-                        because the model over-amplifies style signals at every step.
+        strength: Detail transfer amount from 2nd-pass result onto pass-1.
+        num_steps: Denoising steps for the conditioned 2nd pass.
+        guidance_scale: CFG scale for the 2nd pass (keep low; ~1.0–1.3).
         shift: Flow-matching shift value (match 1st pass).
-        generator: Seeded RNG — reused for noise reproducibility.
+        generator: Seeded RNG — reused for deterministic pass sequencing.
         lora_path_loaded: Loaded LoRA adapter name (empty if none).
         lora_scale: LoRA adapter weight.
 
@@ -636,88 +678,44 @@ def run_2nd_pass(
     global pipeline
 
     w, h = image.size
-    vae = pipeline.vae
-
     print(
         f"2nd pass detailer: strength={strength}, steps={num_steps}, "
         f"guidance={guidance_scale}, shift={shift}"
     )
 
-    # --- Scheduler (same config as 1st pass) ---
-    # use_dynamic_shifting=False: shift is already pre-computed; disabling dynamic
-    # shifting means set_timesteps() won't require `mu` and will use `shift` directly.
+    # Match scheduler behavior from pass-1.
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipeline.scheduler.config, shift=shift, use_dynamic_shifting=False,
+        pipeline.scheduler.config,
+        shift=shift,
     )
     if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
 
-    # --- Build the full sigma schedule, then slice at the strength point ---
-    # all_sigmas: length num_steps+1, decreasing from σ_max → 0.0
-    pipeline.scheduler.set_timesteps(num_steps, device=DEVICE)
-    all_sigmas = pipeline.scheduler.sigmas.cpu()
-
-    # strength=0.3 → skip 70% of steps; run only the last 30%.
-    # skip_n indexes into all_sigmas where our partial schedule begins.
-    skip_n = max(0, min(int(num_steps * (1.0 - strength)), num_steps - 1))
-    start_sigma = all_sigmas[skip_n].item()
-    custom_sigmas = all_sigmas[skip_n:].tolist()
-    actual_steps = len(custom_sigmas) - 1  # sigmas list is always steps+1
-
-    print(f"  start_sigma={start_sigma:.4f}, actual_denoising_steps={actual_steps}")
-
-    # --- VAE encode: PIL RGB → clean latents ---
-    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)  # typically 8
-
-    img_arr = np.array(image.convert("RGB")).astype(np.float32) / 127.5 - 1.0
-    img_t = torch.from_numpy(img_arr).permute(2, 0, 1).unsqueeze(0)
-    img_t = img_t.to(DEVICE, dtype=vae.dtype)
-
-    with torch.inference_mode():
-        clean_latent = vae.encode(img_t).latent_dist.sample(generator)
-
-    # Normalize latents using VAE config values (FLUX VAE: shift≈0.1159, scale≈0.3611)
-    shift_f = getattr(vae.config, "shift_factor", 0.0)
-    scale_f = getattr(vae.config, "scaling_factor", 1.0)
-    clean_latent = (clean_latent - shift_f) * scale_f
-
-    # --- Flow-matching noise injection at start_sigma ---
-    # FLUX flow matching interpolation: x_t = (1−σ)·x_clean + σ·noise
-    # σ=0 → clean image, σ=1 → pure noise; strength=0.3 → σ≈0.3
-    noise = torch.randn(
-        clean_latent.shape, generator=generator, device=DEVICE, dtype=clean_latent.dtype
-    )
-    noisy_latent = (1.0 - start_sigma) * clean_latent + start_sigma * noise
-
-    # --- Convert VAE latents to pipeline's internal format ---
-    # VAE produces (B, C, H_lat, W_lat) = (1, 32, 128, 128).
-    # pipeline_flux2_klein.prepare_latents generates noise at shape
-    # (B, C*4, H_lat//2, W_lat//2) = (1, 128, 64, 64) then flat-reshapes
-    # to [B, H*W, C] = (1, 4096, 128) for the transformer.
-    # pixel_unshuffle(r=2) is the matching space-to-depth op:
-    # (1, 32, 128, 128) → (1, 128, 64, 64)
-    noisy_latent_packed = torch.nn.functional.pixel_unshuffle(noisy_latent, downscale_factor=2)
-
-    # --- Denoise from our partial-noise starting point ---
-    # NOTE: do NOT pass num_inference_steps alongside sigmas.
-    # If the pipeline's __call__ calls scheduler.set_timesteps(num_inference_steps)
-    # before checking sigmas, it builds a fresh full schedule from σ_max→0 and
-    # overrides our custom partial schedule — the pipeline then treats our lightly-
-    # noised latent as if it were near-pure noise, producing a completely different
-    # style. Passing only sigmas lets the pipeline/scheduler use our slice directly.
     t0 = time.time()
     with torch.inference_mode():
-        result = pipeline(
-            prompt=prompt,
-            height=h,
-            width=w,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            latents=noisy_latent_packed,
-            sigmas=custom_sigmas,
-        )
+        try:
+            result = pipeline(
+                prompt=prompt,
+                image=image,
+                height=h,
+                width=w,
+                num_inference_steps=num_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )
+        except TypeError as e:
+            # Backward compatibility for older pipeline builds that may not
+            # support image conditioning in __call__.
+            if "image" in str(e):
+                print("2nd pass skipped: pipeline build does not support image conditioning.")
+                return image
+            raise
+
     print(f"2nd pass complete in {time.time() - t0:.2f}s")
-    return result.images[0]
+    refined = result.images[0]
+
+    # Conservative merge to keep pass-1 identity/style while recovering texture.
+    return _transfer_high_frequency_details(image, refined, amount=strength)
 
 
 def load_lora_weights(
@@ -871,17 +869,19 @@ def initialize_pipeline(
 # Generation Functions
 # ============================================================================
 
-def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
+def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str]] = None) -> Dict[str, Any]:
     """
     Generate images using FLUX.2 pipeline.
 
     Args:
         job_input: Validated input parameters
+        explicit_fields: Keys explicitly provided by caller before validation.
 
     Returns:
         Dictionary containing generated images and metadata
     """
     global pipeline, lora_path_loaded
+    explicit_fields = explicit_fields or set(job_input.keys())
 
     # Initialize pipeline if not already loaded
     if pipeline is None:
@@ -924,15 +924,15 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
 
     # Override with explicit values if provided
     prompt = job_input["prompt"]
-    if "width" in job_input:
+    if "width" in explicit_fields:
         width = job_input["width"]
-    if "height" in job_input:
+    if "height" in explicit_fields:
         height = job_input["height"]
-    if "num_inference_steps" in job_input:
+    if "num_inference_steps" in explicit_fields:
         num_inference_steps = job_input["num_inference_steps"]
-    if "guidance_scale" in job_input:
+    if "guidance_scale" in explicit_fields:
         guidance_scale = job_input["guidance_scale"]
-    if "shift" in job_input:
+    if "shift" in explicit_fields:
         shift = job_input["shift"]
 
     seed = job_input.get("seed", -1)
@@ -984,11 +984,12 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
     # Post-processing: 2nd pass detailer and/or tiled upscale
     # -------------------------------------------------------------------------
     enable_2nd_pass = job_input.get("enable_2nd_pass", False)
-    second_pass_strength = job_input.get("second_pass_strength", 0.3)
-    second_pass_steps = job_input.get("second_pass_steps", 20)
+    second_pass_strength = job_input.get("second_pass_strength", 0.2)
+    second_pass_steps = job_input.get("second_pass_steps", 12)
     second_pass_guidance_scale = job_input.get("second_pass_guidance_scale", 1.0)
     enable_upscale = job_input.get("enable_upscale", False)
     upscale_factor = job_input.get("upscale_factor", 2.0)
+    upscale_blend = job_input.get("upscale_blend", 0.35)
 
     processed_images = []
     for img in result.images:
@@ -1005,7 +1006,11 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 lora_scale=current_lora_scale,
             )
         if enable_upscale:
-            img = tiled_upscale(img, upscale_factor=upscale_factor)
+            img = tiled_upscale(
+                img,
+                upscale_factor=upscale_factor,
+                upscale_blend=upscale_blend,
+            )
         processed_images.append(img)
 
     # Process output images
@@ -1041,6 +1046,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
+                "upscale_blend": upscale_blend if enable_upscale else None,
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
@@ -1077,6 +1083,7 @@ def generate_images(job_input: Dict[str, Any]) -> Dict[str, Any]:
                 "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
+                "upscale_blend": upscale_blend if enable_upscale else None,
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
@@ -1106,6 +1113,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     try:
         job_input = job.get("input", {})
+        explicit_fields = set(job_input.keys())
 
         # Validate input
         validation_result = validate(job_input, INPUT_SCHEMA)
@@ -1118,7 +1126,7 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         validated_input = validation_result["validated_input"]
 
         # Generate images
-        result = generate_images(validated_input)
+        result = generate_images(validated_input, explicit_fields=explicit_fields)
 
         return result
 
