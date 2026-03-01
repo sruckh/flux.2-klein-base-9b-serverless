@@ -36,3 +36,6 @@ protobuf>=5.29.0
 
 # S3 storage for image uploads
 boto3>=1.35.0
+
+# Prompt weighting support
+compel>=2.0.0

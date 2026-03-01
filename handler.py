@@ -189,6 +189,44 @@ PRESETS = {
         "height": 1024,
         "description": "Maximum quality — slowest, most detail"
     },
+
+    # =========================================================================
+    # Character LoRA Optimized Presets
+    # =========================================================================
+
+    # Maximum character fidelity with natural skin — tuned for character LoRAs.
+    # Uses BFL-recommended shift=2.5 for character LoRAs, balanced guidance,
+    # and extra steps for the most natural, detailed output.
+    "character_portrait_best": {
+        "num_inference_steps": 45,
+        "guidance_scale": 2.2,
+        "shift": 2.5,
+        "width": 1024,
+        "height": 1024,
+        "description": "Best quality for character LoRA portraits — natural skin, maximum fidelity"
+    },
+
+    # Portrait orientation for head/shoulders — ~4:5 ratio ideal for faces.
+    # Lower shift for more organic detail in close-ups.
+    "character_portrait_vertical": {
+        "num_inference_steps": 45,
+        "guidance_scale": 2.0,
+        "shift": 2.0,
+        "width": 896,
+        "height": 1152,
+        "description": "Character LoRA — vertical portrait, 4:5 ratio for head/shoulders"
+    },
+
+    # Cinematic 3:2 horizontal — for full-body or environmental character shots.
+    # Higher guidance for stronger composition coherence.
+    "character_cinematic": {
+        "num_inference_steps": 40,
+        "guidance_scale": 2.5,
+        "shift": 2.5,
+        "width": 1344,
+        "height": 896,
+        "description": "Character LoRA — cinematic 3:2 horizontal, full-body or environmental"
+    },
 }
 
 
@@ -287,6 +325,33 @@ INPUT_SCHEMA = {
         "required": False,
         "default": 3.0,  # BFL recommendation: 3.0 for character LoRAs; tune 1.0-7.0
         "constraints": lambda x: 0.1 <= x <= 10.0,
+    },
+    # -------------------------------------------------------------------------
+    # Prompt Enhancement
+    # -------------------------------------------------------------------------
+    "prompt_upsampling": {
+        "type": bool,
+        "required": False,
+        # When True, FLUX.2 auto-enhances the prompt with richer detail and
+        # FLUX-optimized language. Great for simple user inputs.
+        "default": False,
+    },
+    "prompt_2": {
+        "type": str,
+        "required": False,
+        # Optional secondary prompt for prompt weighting. When provided with
+        # prompt_2_weight, the final prompt becomes a weighted blend:
+        #   final = prompt * (1 - weight) + prompt_2 * weight
+        # Example: prompt="TOK woman", prompt_2="cinematic lighting", weight=0.3
+        "default": "",
+    },
+    "prompt_2_weight": {
+        "type": float,
+        "required": False,
+        # Weight for prompt_2 in the blend (0.0 = 100% prompt, 1.0 = 100% prompt_2).
+        # Recommended range: 0.1–0.5 for subtle style influence.
+        "default": 0.0,
+        "constraints": lambda x: 0.0 <= x <= 1.0,
     },
     # -------------------------------------------------------------------------
     # 2nd Pass Detailer (low-denoise img2img for fine detail refinement)
@@ -939,6 +1004,11 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     num_images = job_input.get("num_images", 1)
     output_format = job_input.get("output_format", "png")
 
+    # Prompt enhancement parameters
+    prompt_upsampling = job_input.get("prompt_upsampling", False)
+    prompt_2 = job_input.get("prompt_2", "")
+    prompt_2_weight = job_input.get("prompt_2_weight", 0.0)
+
     # Set random seed
     generator = None
     if seed >= 0:
@@ -960,23 +1030,72 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=current_lora_scale)
 
+    # -------------------------------------------------------------------------
+    # Prompt Enhancement: Weighted blending of two prompts
+    # -------------------------------------------------------------------------
+    # FLUX uses T5 encoder. We create weighted embeddings by:
+    # 1. Encode both prompts separately
+    # 2. Blend: final = prompt_embeds * (1 - weight) + prompt_2_embeds * weight
+    prompt_embeds = None
+    pooled_prompt_embeds = None
+
+    if prompt_2 and prompt_2_weight > 0:
+        print(f"Prompt weighting: blending prompt with prompt_2 at weight {prompt_2_weight}")
+
+        # Encode primary prompt
+        prompt_1_embeds, pooled_1_embeds, _, _ = pipeline.encode_prompt(
+            prompt=prompt,
+            prompt_2=None,
+            device="cuda",
+            num_images_per_prompt=num_images,
+        )
+
+        # Encode secondary prompt
+        prompt_2_embeds, pooled_2_embeds, _, _ = pipeline.encode_prompt(
+            prompt=prompt_2,
+            prompt_2=None,
+            device="cuda",
+            num_images_per_prompt=num_images,
+        )
+
+        # Weighted blend
+        w = prompt_2_weight
+        prompt_embeds = prompt_1_embeds * (1 - w) + prompt_2_embeds * w
+        pooled_prompt_embeds = pooled_1_embeds * (1 - w) + pooled_2_embeds * w
+
+        print(f"Prompt weighting applied: {prompt} + {prompt_2} (weight={w})")
+
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-          f"guidance={guidance_scale}, shift={shift}")
+          f"guidance={guidance_scale}, shift={shift}, upsampling={prompt_upsampling}")
 
     # Generate images
     start_time = time.time()
 
     with torch.inference_mode():
-        result = pipeline(
-            prompt=prompt,
-            # negative_prompt is NOT supported by Flux2KleinPipeline — omit entirely.
-            width=width,
-            height=height,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            generator=generator,
-            num_images_per_prompt=num_images,
-        )
+        # Use prompt_embeds if weighted blending was applied, otherwise use text prompt
+        if prompt_embeds is not None:
+            result = pipeline(
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                num_images_per_prompt=num_images,
+            )
+        else:
+            result = pipeline(
+                prompt=prompt,
+                # negative_prompt is NOT supported by Flux2KleinPipeline — omit entirely.
+                prompt_upsampling=prompt_upsampling,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                num_images_per_prompt=num_images,
+            )
 
     generation_time = time.time() - start_time
 
@@ -1033,6 +1152,9 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "s3",
             "parameters": {
                 "prompt": prompt,
+                "prompt_upsampling": prompt_upsampling,
+                "prompt_2": prompt_2 if prompt_2 else None,
+                "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,
@@ -1070,6 +1192,9 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "base64",
             "parameters": {
                 "prompt": prompt,
+                "prompt_upsampling": prompt_upsampling,
+                "prompt_2": prompt_2 if prompt_2 else None,
+                "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,

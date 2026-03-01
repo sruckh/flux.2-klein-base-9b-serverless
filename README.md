@@ -18,10 +18,12 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **Custom LoRA Support** - Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
 - **LoRA Hot-Swap** - Switch LoRA between requests without reloading the base model
 - **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
-- **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture
+- **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture, plus character LoRA-optimized presets
+- **Prompt Upsampling** - Auto-enhance prompts with FLUX-optimized language for simple user inputs
+- **Prompt Weighting** - Blend two prompts with adjustable weights for fine-grained style control
 - **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
-- **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement — equivalent to a ComfyUI KSampler detailer pass
-- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 512px tiles; resizes to target factor (e.g. 2× output from a 4× SR pass)
+- **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement
+- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 512px tiles
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
@@ -105,6 +107,8 @@ git push -u origin main
 
 All presets are tuned for photorealistic human character output. Lower guidance and shift produce natural skin texture; higher values produce more stylised or structured results.
 
+#### General Purpose Presets
+
 | Preset | Steps | Guidance | Shift | Resolution | Best For |
 |--------|-------|----------|-------|------------|----------|
 | `realistic_character` | 35 | 2.0 | 1.5 | 1024×1024 | **Photorealistic human LoRAs** (default) |
@@ -112,6 +116,16 @@ All presets are tuned for photorealistic human character output. Lower guidance 
 | `cinematic_full` | 35 | 2.5 | 1.5 | 1536×1024 | Full-body cinematic compositions |
 | `fast_preview` | 20 | 2.0 | 1.5 | 1024×1024 | Quick prompt/seed testing |
 | `maximum_quality` | 50 | 2.5 | 1.0 | 1024×1024 | Highest quality final output |
+
+#### Character LoRA Optimized Presets
+
+These presets are specifically tuned for character LoRAs using BFL-recommended settings:
+
+| Preset | Steps | Guidance | Shift | Resolution | Best For |
+|--------|-------|----------|-------|------------|----------|
+| `character_portrait_best` | 45 | 2.2 | 2.5 | 1024×1024 | **Best quality for character portraits** — natural skin, maximum fidelity |
+| `character_portrait_vertical` | 45 | 2.0 | 2.0 | 896×1152 | Head/shoulders portraits — 4:5 ratio ideal for faces |
+| `character_cinematic` | 40 | 2.5 | 2.5 | 1344×896 | Full-body or environmental shots — cinematic 3:2 horizontal |
 
 ### Realistic Character Best Practices
 
@@ -151,8 +165,40 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `1.0` | Maximum fine-detail budget; most natural skin/texture; best for close-up portraits |
 | `1.5` | **Default for photorealistic character LoRAs**; natural texture with good structure |
 | `2.0` | Balanced; slightly stronger large-structure coherence |
+| `2.5` | BFL recommendation for character LoRAs; excellent identity preservation |
 | `3.0` | Better face/structure coherence; may smooth skin texture |
 | `5.0` | Strong structure emphasis; helps complex lighting or multi-figure scenes |
+
+### Prompt Enhancement
+
+#### Prompt Upsampling
+
+Set `prompt_upsampling: true` to automatically enhance your prompt with FLUX-optimized language. This is ideal for:
+- Simple user inputs that need more detail
+- Quick iterations without manual prompt crafting
+- Exploring creative variations
+
+The model will automatically add richer detail, better composition hints, and FLUX-optimized phrasing.
+
+#### Prompt Weighting (Dual-Prompt Blending)
+
+Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
+- `prompt_2`: Secondary prompt to blend with the primary prompt
+- `prompt_2_weight`: Blend factor (0.0 = 100% primary, 1.0 = 100% secondary)
+
+**Example — Add cinematic lighting to a character prompt:**
+```json
+{
+  "prompt": "TOK woman, close-up portrait, natural skin",
+  "prompt_2": "dramatic cinematic lighting, deep shadows, film noir style",
+  "prompt_2_weight": 0.3
+}
+```
+
+**Recommended weights:**
+- `0.1–0.2`: Subtle style influence
+- `0.3–0.4`: Noticeable style blend
+- `0.5+`: Equal or dominant secondary prompt
 
 ### API Reference
 
@@ -161,18 +207,23 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 {
   "input": {
     "prompt": "TOK woman, close-up portrait, soft window light, Sony A7IV, 105mm f/2.8, natural skin, visible pores, unretouched, ISO 800",
-    "preset": "portrait_hd",
+    "preset": "character_portrait_best",
     "lora_path": "https://example.com/your-character-lora.safetensors",
     "lora_scale": 0.85,
-    "guidance_scale": 2.0,
-    "shift": 1.5,
+    "guidance_scale": 2.2,
+    "shift": 2.5,
     "seed": 42,
     "return_type": "s3",
+    "prompt_upsampling": false,
+    "prompt_2": "cinematic lighting, dramatic shadows",
+    "prompt_2_weight": 0.25,
     "enable_2nd_pass": true,
-    "second_pass_strength": 0.3,
-    "second_pass_steps": 20,
+    "second_pass_strength": 0.2,
+    "second_pass_steps": 12,
+    "second_pass_guidance_scale": 1.0,
     "enable_upscale": true,
-    "upscale_factor": 2.0
+    "upscale_factor": 2.0,
+    "upscale_blend": 0.35
   }
 }
 ```
@@ -226,11 +277,19 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
 | `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9 |
+| **Prompt Enhancement** | | | |
+| `prompt_upsampling` | bool | `false` | Auto-enhance prompt with FLUX-optimized language — great for simple user inputs |
+| `prompt_2` | string | `""` | Secondary prompt for weighted blending with primary prompt |
+| `prompt_2_weight` | float | `0.0` | Weight for prompt_2 blend (0.0 = 100% prompt, 1.0 = 100% prompt_2); recommended 0.1–0.5 |
+| **2nd Pass Detailer** | | | |
 | `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass after generation |
-| `second_pass_strength` | float | `0.3` | Detailer denoise strength (0.05–0.95); 0.3 adds skin/pore detail without composition drift |
-| `second_pass_steps` | int | `20` | Inference steps for the 2nd pass (5–50); actual steps applied = `steps × strength` |
+| `second_pass_strength` | float | `0.2` | Detailer denoise strength (0.0–1.0); 0.2 adds skin/pore detail without composition drift |
+| `second_pass_steps` | int | `12` | Inference steps for the 2nd pass (5–50) |
+| `second_pass_guidance_scale` | float | `1.0` | CFG for 2nd pass — keep low (1.0–1.3) to avoid over-saturation |
+| **Upscaler** | | | |
 | `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution upscaling |
 | `upscale_factor` | float | `2.0` | Target upscale multiplier (0.25–4.0); model runs at 4×, result resized to this factor |
+| `upscale_blend` | float | `0.35` | Blend of AI upscale over LANCZOS (0.0–1.0); lower = more faithful to original |
 
 ### Configuration
 
@@ -302,6 +361,21 @@ python flux_train_ui.py
 - **Dataset:** 20–40 images with diverse angles, expressions, and lighting
 
 **Training → Inference Alignment:** Match `num_inference_steps` and `lora_scale` to your AI-Toolkit training YAML's `sample.sample_steps` and `sample.lora_weight`. For `guidance_scale`, start at 2.0 regardless of training YAML value — the training guidance is for the distilled sampler and does not translate directly.
+
+## 📝 Prompt Engineering Guide
+
+See [SYSTEMPROMPT.md](SYSTEMPROMPT.md) for a comprehensive system prompt template that converts messy user input into optimized FLUX.2-klein prompts. This is useful for:
+
+- Building a prompt enhancement layer in your application
+- Converting simple user descriptions into professional prompts
+- Learning FLUX-optimized prompting techniques
+
+The guide includes:
+- Prompt structure framework (Subject + Action + Style + Context)
+- Camera/lens references for photorealism
+- Keywords to avoid (anti-AI-artifact list)
+- Character/portrait best practices
+- Implementation code examples
 
 ## 📄 License
 
