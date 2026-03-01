@@ -329,15 +329,8 @@ INPUT_SCHEMA = {
     # -------------------------------------------------------------------------
     # Prompt Enhancement
     # -------------------------------------------------------------------------
-    "caption_upsample_temperature": {
-        "type": float,
-        "required": False,
-        # When set, FLUX.2 uses a VLM to expand and enrich prompts before generation.
-        # BFL recommends 0.15 for best results. None = disabled (default).
-        # Great for: text in images, image-based instructions, complex reasoning.
-        "default": None,
-        "constraints": lambda x: x is None or 0.0 <= x <= 1.0,
-    },
+    # NOTE: caption_upsample_temperature is NOT supported by Flux2KleinPipeline.
+    # It's only available in Flux2Pipeline (dev variant). Removed to avoid errors.
     "prompt_2": {
         "type": str,
         "required": False,
@@ -1007,7 +1000,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     output_format = job_input.get("output_format", "png")
 
     # Prompt enhancement parameters
-    caption_upsample_temperature = job_input.get("caption_upsample_temperature", None)
     prompt_2 = job_input.get("prompt_2", "")
     prompt_2_weight = job_input.get("prompt_2_weight", 0.0)
 
@@ -1068,7 +1060,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         print(f"Prompt weighting applied: {prompt} + {prompt_2} (weight={w})")
 
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-          f"guidance={guidance_scale}, shift={shift}, caption_upsample={caption_upsample_temperature}")
+          f"guidance={guidance_scale}, shift={shift}")
 
     # Generate images
     start_time = time.time()
@@ -1089,8 +1081,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         else:
             result = pipeline(
                 prompt=prompt,
-                # negative_prompt is NOT supported by Flux2KleinPipeline — omit entirely.
-                caption_upsample_temperature=caption_upsample_temperature,
                 width=width,
                 height=height,
                 num_inference_steps=num_inference_steps,
@@ -1154,7 +1144,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "s3",
             "parameters": {
                 "prompt": prompt,
-                "caption_upsample_temperature": caption_upsample_temperature,
                 "prompt_2": prompt_2 if prompt_2 else None,
                 "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
@@ -1194,7 +1183,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "base64",
             "parameters": {
                 "prompt": prompt,
-                "caption_upsample_temperature": caption_upsample_temperature,
                 "prompt_2": prompt_2 if prompt_2 else None,
                 "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
