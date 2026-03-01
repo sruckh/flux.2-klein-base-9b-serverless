@@ -329,12 +329,14 @@ INPUT_SCHEMA = {
     # -------------------------------------------------------------------------
     # Prompt Enhancement
     # -------------------------------------------------------------------------
-    "prompt_upsampling": {
-        "type": bool,
+    "caption_upsample_temperature": {
+        "type": float,
         "required": False,
-        # When True, FLUX.2 auto-enhances the prompt with richer detail and
-        # FLUX-optimized language. Great for simple user inputs.
-        "default": False,
+        # When set, FLUX.2 uses a VLM to expand and enrich prompts before generation.
+        # BFL recommends 0.15 for best results. None = disabled (default).
+        # Great for: text in images, image-based instructions, complex reasoning.
+        "default": None,
+        "constraints": lambda x: x is None or 0.0 <= x <= 1.0,
     },
     "prompt_2": {
         "type": str,
@@ -1005,7 +1007,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     output_format = job_input.get("output_format", "png")
 
     # Prompt enhancement parameters
-    prompt_upsampling = job_input.get("prompt_upsampling", False)
+    caption_upsample_temperature = job_input.get("caption_upsample_temperature", None)
     prompt_2 = job_input.get("prompt_2", "")
     prompt_2_weight = job_input.get("prompt_2_weight", 0.0)
 
@@ -1066,7 +1068,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         print(f"Prompt weighting applied: {prompt} + {prompt_2} (weight={w})")
 
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-          f"guidance={guidance_scale}, shift={shift}, upsampling={prompt_upsampling}")
+          f"guidance={guidance_scale}, shift={shift}, caption_upsample={caption_upsample_temperature}")
 
     # Generate images
     start_time = time.time()
@@ -1088,7 +1090,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             result = pipeline(
                 prompt=prompt,
                 # negative_prompt is NOT supported by Flux2KleinPipeline — omit entirely.
-                prompt_upsampling=prompt_upsampling,
+                caption_upsample_temperature=caption_upsample_temperature,
                 width=width,
                 height=height,
                 num_inference_steps=num_inference_steps,
@@ -1152,7 +1154,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "s3",
             "parameters": {
                 "prompt": prompt,
-                "prompt_upsampling": prompt_upsampling,
+                "caption_upsample_temperature": caption_upsample_temperature,
                 "prompt_2": prompt_2 if prompt_2 else None,
                 "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
@@ -1192,7 +1194,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "base64",
             "parameters": {
                 "prompt": prompt,
-                "prompt_upsampling": prompt_upsampling,
+                "caption_upsample_temperature": caption_upsample_temperature,
                 "prompt_2": prompt_2 if prompt_2 else None,
                 "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,

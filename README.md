@@ -171,14 +171,23 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 
 ### Prompt Enhancement
 
-#### Prompt Upsampling
+#### Caption Upsampling
 
-Set `prompt_upsampling: true` to automatically enhance your prompt with FLUX-optimized language. This is ideal for:
-- Simple user inputs that need more detail
-- Quick iterations without manual prompt crafting
-- Exploring creative variations
+Set `caption_upsample_temperature: 0.15` to automatically enhance your prompt with FLUX-optimized language. This is ideal for:
+- Text generation in images (memes, posters)
+- Image-based instructions requiring reasoning
+- Code and math visualizations
+- Complex prompts requiring interpretation
 
-The model will automatically add richer detail, better composition hints, and FLUX-optimized phrasing.
+The model uses a VLM to expand and enrich prompts before generation. BFL recommends a temperature of **0.15** for best results.
+
+**Example:**
+```json
+{
+  "prompt": "Make a meme about AI",
+  "caption_upsample_temperature": 0.15
+}
+```
 
 #### Prompt Weighting (Dual-Prompt Blending)
 
@@ -214,7 +223,7 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
     "shift": 2.5,
     "seed": 42,
     "return_type": "s3",
-    "prompt_upsampling": false,
+    "caption_upsample_temperature": null,
     "prompt_2": "cinematic lighting, dramatic shadows",
     "prompt_2_weight": 0.25,
     "enable_2nd_pass": true,
@@ -278,7 +287,7 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
 | `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9 |
 | **Prompt Enhancement** | | | |
-| `prompt_upsampling` | bool | `false` | Auto-enhance prompt with FLUX-optimized language — great for simple user inputs |
+| `caption_upsample_temperature` | float | `null` | VLM-based prompt enhancement; set to `0.15` (BFL recommended) to enable |
 | `prompt_2` | string | `""` | Secondary prompt for weighted blending with primary prompt |
 | `prompt_2_weight` | float | `0.0` | Weight for prompt_2 blend (0.0 = 100% prompt, 1.0 = 100% prompt_2); recommended 0.1–0.5 |
 | **2nd Pass Detailer** | | | |
