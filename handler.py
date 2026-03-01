@@ -86,7 +86,7 @@ DEFAULT_MODEL_ID = os.getenv(
 )
 
 DEFAULT_LORA_PATH = os.getenv("DEFAULT_LORA_PATH", "")
-DEFAULT_LORA_SCALE = float(os.getenv("DEFAULT_LORA_SCALE", "1.0"))
+DEFAULT_LORA_SCALE = float(os.getenv("DEFAULT_LORA_SCALE", "0.85"))
 
 DEVICE = os.getenv("DEVICE", "cuda")
 DTYPE = os.getenv("DTYPE", "float8_e4m3fn").lower()
@@ -123,8 +123,10 @@ UPSCALER_MODEL_PATH = os.getenv(
     "UPSCALER_MODEL_PATH",
     "/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth",
 )
-UPSCALE_TILE_SIZE = 512    # input-space tile size in pixels
-UPSCALE_TILE_OVERLAP = 32  # input-space overlap between tiles in pixels
+UPSCALE_TILE_SIZE = 384    # input-space tile size in pixels
+UPSCALE_TILE_OVERLAP = 64  # input-space overlap between tiles in pixels
+# 64/384 = 16.7% overlap ratio vs 32/512 = 6.25% — doubles the feather-blend zone,
+# eliminating seam artifacts without increasing tile count for typical inputs.
 
 
 # ============================================================================
@@ -271,13 +273,13 @@ INPUT_SCHEMA = {
     "num_inference_steps": {
         "type": int,
         "required": False,
-        "default": 28,
+        "default": 35,  # 35 is the sweet spot for the base (undistilled) model
         "constraints": lambda x: 1 <= x <= 100,
     },
     "guidance_scale": {
         "type": float,
         "required": False,
-        "default": 4.0,  # BFL default for base (undistilled) model; range 3.5-5.0
+        "default": 2.0,  # 2.0–2.5 for photorealism; higher values produce plastic/CG skin
         "constraints": lambda x: x >= 0,
     },
     "seed": {
@@ -323,30 +325,8 @@ INPUT_SCHEMA = {
     "shift": {
         "type": float,
         "required": False,
-        "default": 3.0,  # BFL recommendation: 3.0 for character LoRAs; tune 1.0-7.0
+        "default": 1.5,  # 1.5 for photorealism; 2.5 for character LoRAs; higher = more structure
         "constraints": lambda x: 0.1 <= x <= 10.0,
-    },
-    # -------------------------------------------------------------------------
-    # Prompt Enhancement
-    # -------------------------------------------------------------------------
-    # NOTE: caption_upsample_temperature is NOT supported by Flux2KleinPipeline.
-    # It's only available in Flux2Pipeline (dev variant). Removed to avoid errors.
-    "prompt_2": {
-        "type": str,
-        "required": False,
-        # Optional secondary prompt for prompt weighting. When provided with
-        # prompt_2_weight, the final prompt becomes a weighted blend:
-        #   final = prompt * (1 - weight) + prompt_2 * weight
-        # Example: prompt="TOK woman", prompt_2="cinematic lighting", weight=0.3
-        "default": "",
-    },
-    "prompt_2_weight": {
-        "type": float,
-        "required": False,
-        # Weight for prompt_2 in the blend (0.0 = 100% prompt, 1.0 = 100% prompt_2).
-        # Recommended range: 0.1–0.5 for subtle style influence.
-        "default": 0.0,
-        "constraints": lambda x: 0.0 <= x <= 1.0,
     },
     # -------------------------------------------------------------------------
     # 2nd Pass Detailer (low-denoise img2img for fine detail refinement)
@@ -998,10 +978,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     seed = job_input.get("seed", -1)
     num_images = job_input.get("num_images", 1)
     output_format = job_input.get("output_format", "png")
-
-    # Prompt enhancement parameters
-    prompt_2 = job_input.get("prompt_2", "")
-    prompt_2_weight = job_input.get("prompt_2_weight", 0.0)
+    max_sequence_length = job_input.get("max_sequence_length", 512)
 
     # Set random seed
     generator = None
@@ -1024,41 +1001,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     if lora_path_loaded:
         pipeline.set_adapters("flux_lora", adapter_weights=current_lora_scale)
 
-    # -------------------------------------------------------------------------
-    # Prompt Enhancement: Weighted blending of two prompts
-    # -------------------------------------------------------------------------
-    # FLUX uses T5 encoder. We create weighted embeddings by:
-    # 1. Encode both prompts separately
-    # 2. Blend: final = prompt_embeds * (1 - weight) + prompt_2_embeds * weight
-    prompt_embeds = None
-    pooled_prompt_embeds = None
-
-    if prompt_2 and prompt_2_weight > 0:
-        print(f"Prompt weighting: blending prompt with prompt_2 at weight {prompt_2_weight}")
-
-        # Encode primary prompt
-        prompt_1_embeds, pooled_1_embeds, _, _ = pipeline.encode_prompt(
-            prompt=prompt,
-            prompt_2=None,
-            device="cuda",
-            num_images_per_prompt=num_images,
-        )
-
-        # Encode secondary prompt
-        prompt_2_embeds, pooled_2_embeds, _, _ = pipeline.encode_prompt(
-            prompt=prompt_2,
-            prompt_2=None,
-            device="cuda",
-            num_images_per_prompt=num_images,
-        )
-
-        # Weighted blend
-        w = prompt_2_weight
-        prompt_embeds = prompt_1_embeds * (1 - w) + prompt_2_embeds * w
-        pooled_prompt_embeds = pooled_1_embeds * (1 - w) + pooled_2_embeds * w
-
-        print(f"Prompt weighting applied: {prompt} + {prompt_2} (weight={w})")
-
     print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
           f"guidance={guidance_scale}, shift={shift}")
 
@@ -1066,28 +1008,16 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     start_time = time.time()
 
     with torch.inference_mode():
-        # Use prompt_embeds if weighted blending was applied, otherwise use text prompt
-        if prompt_embeds is not None:
-            result = pipeline(
-                prompt_embeds=prompt_embeds,
-                pooled_prompt_embeds=pooled_prompt_embeds,
-                width=width,
-                height=height,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                num_images_per_prompt=num_images,
-            )
-        else:
-            result = pipeline(
-                prompt=prompt,
-                width=width,
-                height=height,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=guidance_scale,
-                generator=generator,
-                num_images_per_prompt=num_images,
-            )
+        result = pipeline(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            generator=generator,
+            num_images_per_prompt=num_images,
+            max_sequence_length=max_sequence_length,
+        )
 
     generation_time = time.time() - start_time
 
@@ -1144,8 +1074,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "s3",
             "parameters": {
                 "prompt": prompt,
-                "prompt_2": prompt_2 if prompt_2 else None,
-                "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,
@@ -1183,8 +1111,6 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "return_type": "base64",
             "parameters": {
                 "prompt": prompt,
-                "prompt_2": prompt_2 if prompt_2 else None,
-                "prompt_2_weight": prompt_2_weight if prompt_2 else None,
                 "width": width,
                 "height": height,
                 "num_inference_steps": num_inference_steps,

@@ -19,11 +19,9 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **LoRA Hot-Swap** - Switch LoRA between requests without reloading the base model
 - **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
 - **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture, plus character LoRA-optimized presets
-- **Prompt Upsampling** - Auto-enhance prompts with FLUX-optimized language for simple user inputs
-- **Prompt Weighting** - Blend two prompts with adjustable weights for fine-grained style control
 - **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
 - **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement
-- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 512px tiles
+- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap (16.7% ratio for seam-free output)
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
@@ -43,7 +41,7 @@ The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscret
 3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
-6. **2nd Pass Detailer** *(optional)* — `Flux2KleinPipeline` is text-to-image only (no native img2img). The detailer is implemented manually: VAE-encode the 1st pass output → inject flow-matching noise at `start_sigma` corresponding to `strength` (`x_t = (1−σ)·x_clean + σ·noise`) → convert to pipeline's internal latent format via `pixel_unshuffle(r=2)` → call pipeline with pre-computed noisy latents + partial sigma schedule; LoRA stays active for subject consistency
+6. **2nd Pass Detailer** *(optional)* — Calls `Flux2KleinPipeline` again with the 1st pass image as the `image` conditioning input at low steps and low guidance. High-frequency detail from the refined result is blended back onto the 1st pass output via `_transfer_high_frequency_details()`, preserving identity and composition while adding skin pore and micro-contrast texture. LoRA stays active for subject consistency.
 7. **Tiled Upscale** *(optional)* — DRCT-L 4× SR via spandrel with 512px/32px feather-blended tiles; result resized to `upscale_factor` via LANCZOS; model auto-downloaded to `/runpod-volume/models/` on first use
 8. **Output** — Images uploaded to S3 (presigned URL) or encoded to base64
 
@@ -169,30 +167,6 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `3.0` | Better face/structure coherence; may smooth skin texture |
 | `5.0` | Strong structure emphasis; helps complex lighting or multi-figure scenes |
 
-### Prompt Enhancement
-
-> **Note:** Caption upsampling (`caption_upsample_temperature`) is NOT supported by Flux2KleinPipeline. It's only available in Flux2Pipeline (dev variant).
-
-#### Prompt Weighting (Dual-Prompt Blending)
-
-Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
-- `prompt_2`: Secondary prompt to blend with the primary prompt
-- `prompt_2_weight`: Blend factor (0.0 = 100% primary, 1.0 = 100% secondary)
-
-**Example — Add cinematic lighting to a character prompt:**
-```json
-{
-  "prompt": "TOK woman, close-up portrait, natural skin",
-  "prompt_2": "dramatic cinematic lighting, deep shadows, film noir style",
-  "prompt_2_weight": 0.3
-}
-```
-
-**Recommended weights:**
-- `0.1–0.2`: Subtle style influence
-- `0.3–0.4`: Noticeable style blend
-- `0.5+`: Equal or dominant secondary prompt
-
 ### API Reference
 
 **Request Format:**
@@ -207,8 +181,6 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
     "shift": 2.5,
     "seed": 42,
     "return_type": "s3",
-    "prompt_2": "cinematic lighting, dramatic shadows",
-    "prompt_2_weight": 0.25,
     "enable_2nd_pass": true,
     "second_pass_strength": 0.2,
     "second_pass_steps": 12,
@@ -260,18 +232,16 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
 | `preset` | string | `realistic_character` | Quality preset (see table above) |
 | `width` | int | `1024` | Image width (multiple of 16) |
 | `height` | int | `1024` | Image height (multiple of 16) |
-| `num_inference_steps` | int | `35` | Denoising steps — use 35–50 for base model |
-| `guidance_scale` | float | `2.0` | CFG scale — 2.0–2.5 for photorealism; higher = more stylised |
+| `num_inference_steps` | int | `35` | Denoising steps — 35–50 for base model; 50 for maximum quality |
+| `guidance_scale` | float | `2.0` | CFG scale — 2.0–2.5 for photorealism; higher = more stylised/plastic |
 | `shift` | float | `1.5` | Scheduler shift — 1.0–1.5 for natural skin texture; higher for structure |
 | `seed` | int | `-1` | Random seed (-1 for random) |
 | `num_images` | int | `1` | Number of images per request (1–4) |
 | `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
 | `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
-| `lora_scale` | float | `1.0` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9 |
-| **Prompt Enhancement** | | | |
-| `prompt_2` | string | `""` | Secondary prompt for weighted blending with primary prompt |
-| `prompt_2_weight` | float | `0.0` | Weight for prompt_2 blend (0.0 = 100% prompt, 1.0 = 100% prompt_2); recommended 0.1–0.5 |
+| `lora_scale` | float | `0.85` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9; 1.0+ pushes identity too hard |
+| `max_sequence_length` | int | `512` | Maximum token length for text encoding (up to 512) |
 | **2nd Pass Detailer** | | | |
 | `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass after generation |
 | `second_pass_strength` | float | `0.2` | Detailer denoise strength (0.0–1.0); 0.2 adds skin/pore detail without composition drift |
@@ -280,7 +250,7 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
 | **Upscaler** | | | |
 | `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution upscaling |
 | `upscale_factor` | float | `2.0` | Target upscale multiplier (0.25–4.0); model runs at 4×, result resized to this factor |
-| `upscale_blend` | float | `0.35` | Blend of AI upscale over LANCZOS (0.0–1.0); lower = more faithful to original |
+| `upscale_blend` | float | `0.35` | Blend of AI upscale over LANCZOS (0.0–1.0); lower = more faithful to original; 0.35 preserves color/composition |
 
 ### Configuration
 
@@ -331,7 +301,7 @@ Use `prompt_2` and `prompt_2_weight` to blend two prompts together:
 
 The default `DTYPE=float8_e4m3fn` triggers INT8 quantization of the transformer via optimum-quanto, reducing transformer VRAM from ~18 GB to ~9 GB while keeping text encoders and VAE at BF16.
 
-The 2nd pass detailer reuses the already-loaded `Flux2KleinPipeline` with an `image` + `strength` parameter — no second model is loaded, so VRAM usage is identical to a standard generation request. The DRCT-L upscaler (~300 MB) is loaded separately via spandrel and cached globally after first use; tiled inference keeps peak per-tile GPU memory negligible.
+The 2nd pass detailer reuses the already-loaded `Flux2KleinPipeline` with the `image` conditioning parameter — no second model is loaded, so VRAM usage is identical to a standard generation request. The DRCT-L upscaler (~300 MB) is loaded separately via spandrel and cached globally after first use; 384px tiles with 64px overlap (16.7% blend ratio) eliminate seam artifacts while keeping per-tile VRAM negligible.
 
 ## 🎨 Training Custom LoRAs
 
