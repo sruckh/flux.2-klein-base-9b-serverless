@@ -188,6 +188,7 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
         "adapter_name": "style"
       }
     ],
+    "lora_scale_mode": "normalized",
     "guidance_scale": 2.2,
     "shift": 2.5,
     "seed": 42,
@@ -196,6 +197,7 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
     "second_pass_strength": 0.2,
     "second_pass_steps": 12,
     "second_pass_guidance_scale": 1.0,
+    "second_pass_lora_scale_multiplier": 0.7,
     "enable_upscale": true,
     "upscale_factor": 2.0,
     "upscale_blend": 0.35
@@ -270,8 +272,11 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `num_images` | int | `1` | Number of images per request (1–4) |
 | `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
-| `loras` | list | `[]` | Optional multi-LoRA input. Each item: `{ "path": string, "scale": float, "adapter_name": string? }`; `adapter_name` defaults to `flux_lora_<index>` |
-| `lora_path` | string | `""` | Legacy single-LoRA path (used when `loras` is not provided) |
+| `loras` | list | `[]` | Optional multi-LoRA input. Each item: `{ "path": string, "scale": float, "adapter_name": string? }`; `path` aliases `url`, `lora_url`, `lora_path` are accepted; scale aliases `strength`, `weight`, `lora_scale` are accepted; `adapter_name` defaults to `flux_lora_<index>` (or `trigger_word` if provided) |
+| `additional_lora` | string | `""` | Frontend-compatibility alias for a second LoRA path when not using `loras`; aliases: `additional_lora_path`, `additional_lora_url`, `addition_lora`, `addition_lora_url` |
+| `additional_lora_strength` | float | `0.85` | Frontend-compatibility alias for second LoRA strength (0.0–2.0); `additional_lora_scale` is also accepted |
+| `lora_scale_mode` | string | `"absolute"` | Multi-LoRA scale interpretation: `absolute` (raw scales passed through) or `normalized` (scales are normalized to sum to 1.0 after multiplier) |
+| `lora_path` | string | `""` | Legacy single-LoRA path (used when `loras` is not provided); alias: `lora_url` |
 | `lora_scale` | float | `0.85` | Legacy single-LoRA scale (0.0–2.0; used with `lora_path`) |
 | `max_sequence_length` | int | `512` | Maximum token length for text encoding (up to 512) |
 | **2nd Pass Detailer** | | | |
@@ -279,6 +284,7 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `second_pass_strength` | float | `0.2` | Detailer denoise strength (0.0–1.0); 0.2 adds skin/pore detail without composition drift |
 | `second_pass_steps` | int | `12` | Inference steps for the 2nd pass (5–50) |
 | `second_pass_guidance_scale` | float | `1.0` | CFG for 2nd pass — keep low (1.0–1.3) to avoid over-saturation |
+| `second_pass_lora_scale_multiplier` | float | `1.0` | Multiplier for LoRA scales in 2nd pass (0.0–2.0); use `<1.0` if LoRA effects feel too strong after detail pass |
 | **Upscaler** | | | |
 | `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution upscaling |
 | `upscale_factor` | float | `2.0` | Target upscale multiplier (0.25–4.0); model runs at 4×, result resized to this factor |

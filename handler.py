@@ -298,7 +298,61 @@ INPUT_SCHEMA = {
         "required": False,
         "default": DEFAULT_LORA_PATH,
     },
+    "lora_url": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
     "lora_scale": {
+        "type": float,
+        "required": False,
+        "default": DEFAULT_LORA_SCALE,
+        "constraints": lambda x: 0.0 <= x <= 2.0,
+    },
+    "additional_lora": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
+    "additional_lora_path": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
+    "additional_lora_url": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
+    "additional_lora_strength": {
+        "type": float,
+        "required": False,
+        "default": DEFAULT_LORA_SCALE,
+        "constraints": lambda x: 0.0 <= x <= 2.0,
+    },
+    "additional_lora_scale": {
+        "type": float,
+        "required": False,
+        "default": DEFAULT_LORA_SCALE,
+        "constraints": lambda x: 0.0 <= x <= 2.0,
+    },
+    "addition_lora": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
+    "addition_lora_url": {
+        "type": str,
+        "required": False,
+        "default": "",
+    },
+    "addition_lora_strength": {
+        "type": float,
+        "required": False,
+        "default": DEFAULT_LORA_SCALE,
+        "constraints": lambda x: 0.0 <= x <= 2.0,
+    },
+    "addition_lora_scale": {
         "type": float,
         "required": False,
         "default": DEFAULT_LORA_SCALE,
@@ -309,6 +363,12 @@ INPUT_SCHEMA = {
         "required": False,
         "default": [],
         "constraints": lambda x: all(isinstance(item, dict) for item in x),
+    },
+    "lora_scale_mode": {
+        "type": str,
+        "required": False,
+        "default": "absolute",
+        "constraints": lambda x: x in ["absolute", "normalized"],
     },
     "output_format": {
         "type": str,
@@ -362,6 +422,12 @@ INPUT_SCHEMA = {
         "default": 1.0,  # Much lower than 1st pass — high CFG on a near-clean latent
         # causes over-saturation and plastic/cartoon look. 1.0–1.3 recommended.
         "constraints": lambda x: 0.1 <= x <= 5.0,
+    },
+    "second_pass_lora_scale_multiplier": {
+        "type": float,
+        "required": False,
+        "default": 1.0,
+        "constraints": lambda x: 0.0 <= x <= 2.0,
     },
     # -------------------------------------------------------------------------
     # Tiled Upscaler (DRCT-L 4x → resize to target factor)
@@ -688,6 +754,135 @@ def _transfer_high_frequency_details(
     return Image.fromarray(mixed, "RGB")
 
 
+def _extract_lora_scale(lora: Dict[str, Any], index: int) -> float:
+    """Extract LoRA scale from accepted aliases and validate range."""
+    scale_keys = [k for k in ("scale", "strength", "weight", "lora_scale") if k in lora and lora.get(k) is not None]
+    if not scale_keys:
+        raise ValueError(
+            f"`loras[{index}]` must include one scale key: `scale` (preferred), `strength`, `weight`, or `lora_scale`"
+        )
+    if len(scale_keys) > 1:
+        raise ValueError(f"`loras[{index}]` provides multiple scale keys {scale_keys}; use exactly one")
+
+    scale = _coerce_scale_value(lora[scale_keys[0]], f"`loras[{index}].{scale_keys[0]}`")
+    if not (0.0 <= scale <= 2.0):
+        raise ValueError(f"`loras[{index}].{scale_keys[0]}` must be between 0.0 and 2.0")
+
+    return scale
+
+
+def _coerce_scale_value(value: Any, label: str) -> float:
+    """Coerce numeric/string scale value to float with strict validation."""
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a number")
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{label} must be a number")
+        try:
+            value = float(stripped)
+        except ValueError as e:
+            raise ValueError(f"{label} must be a number") from e
+    elif isinstance(value, (int, float)):
+        value = float(value)
+    else:
+        raise ValueError(f"{label} must be a number")
+
+    return float(value)
+
+
+def _extract_optional_scale(
+    job_input: Dict[str, Any],
+    keys: List[str],
+    explicit_fields: Optional[set[str]] = None,
+) -> Optional[float]:
+    """Extract optional numeric scale from aliases, preferring explicit keys."""
+    if explicit_fields:
+        explicit_keys = [k for k in keys if k in explicit_fields and job_input.get(k) is not None]
+        if len(explicit_keys) > 1:
+            raise ValueError(f"Conflicting LoRA scale aliases provided: {explicit_keys}; use exactly one")
+        if explicit_keys:
+            key = explicit_keys[0]
+            value = _coerce_scale_value(job_input.get(key), f"`{key}`")
+            if not (0.0 <= value <= 2.0):
+                raise ValueError(f"`{key}` must be between 0.0 and 2.0")
+            return value
+        return None
+
+    for key in keys:
+        if key in job_input and job_input.get(key) is not None:
+            value = _coerce_scale_value(job_input.get(key), f"`{key}`")
+            if not (0.0 <= value <= 2.0):
+                raise ValueError(f"`{key}` must be between 0.0 and 2.0")
+            return value
+    return None
+
+
+def _extract_optional_path(
+    job_input: Dict[str, Any],
+    keys: List[str],
+    explicit_fields: Optional[set[str]] = None,
+) -> str:
+    """Extract optional non-empty path from aliases, preferring explicit keys."""
+    if explicit_fields:
+        for key in keys:
+            if key in explicit_fields:
+                value = job_input.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    for key in keys:
+        value = job_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _preprocess_job_input(raw_job_input: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce known numeric-string LoRA fields before schema validation."""
+    if not isinstance(raw_job_input, dict):
+        return raw_job_input
+
+    job_input = dict(raw_job_input)
+    float_keys = [
+        "lora_scale",
+        "additional_lora_strength",
+        "additional_lora_scale",
+        "addition_lora_strength",
+        "addition_lora_scale",
+        "second_pass_lora_scale_multiplier",
+    ]
+    for key in float_keys:
+        value = job_input.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                job_input[key] = float(value.strip())
+            except ValueError:
+                pass
+
+    raw_loras = job_input.get("loras")
+    if isinstance(raw_loras, list):
+        normalized_loras = []
+        for item in raw_loras:
+            if not isinstance(item, dict):
+                normalized_loras.append(item)
+                continue
+            normalized_item = dict(item)
+            for key in ("scale", "strength", "weight", "lora_scale"):
+                value = normalized_item.get(key)
+                if isinstance(value, str) and value.strip():
+                    try:
+                        normalized_item[key] = float(value.strip())
+                    except ValueError:
+                        pass
+            normalized_loras.append(normalized_item)
+        job_input["loras"] = normalized_loras
+
+    return job_input
+
+
 def _normalize_lora_adapters(job_input: Dict[str, Any], explicit_fields: set[str]) -> List[Dict[str, Any]]:
     """Normalize LoRA request input into a list of adapter specs.
 
@@ -710,16 +905,19 @@ def _normalize_lora_adapters(job_input: Dict[str, Any], explicit_fields: set[str
 
             path = lora.get("path")
             if not isinstance(path, str) or not path.strip():
-                raise ValueError(f"`loras[{i}].path` must be a non-empty string")
+                path = lora.get("url") or lora.get("lora_url") or lora.get("lora_path")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(f"`loras[{i}]` must include a non-empty `path` (or alias `url`/`lora_url`/`lora_path`)")
 
-            scale = lora.get("scale", DEFAULT_LORA_SCALE)
-            if not isinstance(scale, (int, float)):
-                raise ValueError(f"`loras[{i}].scale` must be a number")
-            scale = float(scale)
-            if not (0.0 <= scale <= 2.0):
-                raise ValueError(f"`loras[{i}].scale` must be between 0.0 and 2.0")
+            scale = _extract_lora_scale(lora, i)
 
-            adapter_name = lora.get("adapter_name", f"flux_lora_{i}")
+            adapter_name = (
+                lora.get("adapter_name")
+                or lora.get("name")
+                or lora.get("trigger_word")
+                or lora.get("triggerWord")
+                or f"flux_lora_{i}"
+            )
             if not isinstance(adapter_name, str) or not adapter_name.strip():
                 raise ValueError(f"`loras[{i}].adapter_name` must be a non-empty string if provided")
 
@@ -737,18 +935,55 @@ def _normalize_lora_adapters(job_input: Dict[str, Any], explicit_fields: set[str
 
         return normalized_loras
 
-    legacy_lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
-    if not isinstance(legacy_lora_path, str) or not legacy_lora_path.strip():
-        return []
+    normalized_loras: List[Dict[str, Any]] = []
 
-    legacy_lora_scale = float(job_input.get("lora_scale", DEFAULT_LORA_SCALE))
-    return [
-        {
-            "path": legacy_lora_path.strip(),
-            "scale": legacy_lora_scale,
-            "adapter_name": "flux_lora",
-        }
-    ]
+    legacy_lora_path = _extract_optional_path(job_input, ["lora_path", "lora_url"], explicit_fields=explicit_fields)
+    if not legacy_lora_path and "lora_path" not in explicit_fields and "lora_url" not in explicit_fields:
+        legacy_lora_path = DEFAULT_LORA_PATH
+
+    if isinstance(legacy_lora_path, str) and legacy_lora_path.strip():
+        legacy_lora_scale = _extract_optional_scale(job_input, ["lora_scale"], explicit_fields=explicit_fields)
+        if legacy_lora_scale is None:
+            legacy_lora_scale = float(job_input.get("lora_scale", DEFAULT_LORA_SCALE))
+        if not (0.0 <= legacy_lora_scale <= 2.0):
+            raise ValueError("`lora_scale` must be between 0.0 and 2.0")
+        normalized_loras.append(
+            {
+                "path": legacy_lora_path.strip(),
+                "scale": legacy_lora_scale,
+                "adapter_name": "flux_lora",
+            }
+        )
+
+    # Frontend-compatibility aliases for a second/additional LoRA without requiring `loras`.
+    additional_lora_path = _extract_optional_path(
+        job_input,
+        [
+            "additional_lora",
+            "additional_lora_path",
+            "additional_lora_url",
+            "addition_lora",
+            "addition_lora_url",
+        ],
+        explicit_fields=explicit_fields,
+    )
+    if additional_lora_path:
+        additional_lora_scale = _extract_optional_scale(
+            job_input,
+            ["additional_lora_strength", "additional_lora_scale", "addition_lora_strength", "addition_lora_scale"],
+            explicit_fields=explicit_fields,
+        )
+        if additional_lora_scale is None:
+            additional_lora_scale = DEFAULT_LORA_SCALE
+        normalized_loras.append(
+            {
+                "path": additional_lora_path,
+                "scale": additional_lora_scale,
+                "adapter_name": "flux_lora_1",
+            }
+        )
+
+    return normalized_loras
 
 
 def _lora_stack_signature(lora_adapters: List[Dict[str, Any]]) -> tuple[tuple[str, str], ...]:
@@ -759,15 +994,40 @@ def _lora_stack_signature(lora_adapters: List[Dict[str, Any]]) -> tuple[tuple[st
 def _set_active_lora_adapters(
     pipeline: Flux2KleinPipeline,
     lora_adapters: List[Dict[str, Any]],
-) -> None:
-    """Apply active LoRA adapter names and scales to the pipeline."""
+    scale_mode: str = "absolute",
+    scale_multiplier: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """Apply active LoRA adapter names and scales to the pipeline.
+
+    Returns:
+        Applied adapter list including resolved `effective_scale`.
+    """
     if not lora_adapters:
-        return
+        return []
+
+    raw_scales = [float(item["scale"]) for item in lora_adapters]
+    scaled = [max(0.0, s * scale_multiplier) for s in raw_scales]
+    if scale_mode == "normalized":
+        total = sum(scaled)
+        if total > 0:
+            scaled = [s / total for s in scaled]
+
+    applied = []
+    for item, eff in zip(lora_adapters, scaled):
+        applied.append(
+            {
+                "path": item["path"],
+                "adapter_name": item["adapter_name"],
+                "scale": item["scale"],
+                "effective_scale": eff,
+            }
+        )
 
     pipeline.set_adapters(
-        [item["adapter_name"] for item in lora_adapters],
-        adapter_weights=[item["scale"] for item in lora_adapters],
+        [item["adapter_name"] for item in applied],
+        adapter_weights=[item["effective_scale"] for item in applied],
     )
+    return applied
 
 def run_2nd_pass(
     image: Image.Image,
@@ -778,6 +1038,8 @@ def run_2nd_pass(
     shift: float,
     generator: torch.Generator,
     lora_adapters: List[Dict[str, Any]],
+    lora_scale_mode: str,
+    lora_scale_multiplier: float,
 ) -> Image.Image:
     """
     Conservative 2nd-pass detailer using FLUX2 image conditioning.
@@ -796,6 +1058,8 @@ def run_2nd_pass(
         shift: Flow-matching shift value (match 1st pass).
         generator: Seeded RNG — reused for deterministic pass sequencing.
         lora_adapters: Active LoRA adapters and scales.
+        lora_scale_mode: How LoRA scales are interpreted ("absolute" or "normalized").
+        lora_scale_multiplier: Additional multiplier applied to all LoRA scales in pass-2.
 
     Returns:
         Refined PIL Image.
@@ -813,7 +1077,21 @@ def run_2nd_pass(
         pipeline.scheduler.config,
         shift=shift,
     )
-    _set_active_lora_adapters(pipeline, lora_adapters)
+    _set_active_lora_adapters(
+        pipeline,
+        lora_adapters,
+        scale_mode=lora_scale_mode,
+        scale_multiplier=lora_scale_multiplier,
+    )
+    if lora_adapters:
+        print(
+            "2nd pass LoRA scaling: "
+            + ", ".join(
+                f"{item['adapter_name']}={max(0.0, float(item['scale']) * float(lora_scale_multiplier)):.4f}"
+                for item in lora_adapters
+            )
+            + (f" ({lora_scale_mode})" if lora_scale_mode else "")
+        )
 
     t0 = time.time()
     with torch.inference_mode():
@@ -1029,6 +1307,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     explicit_fields = explicit_fields or set(job_input.keys())
 
     requested_lora_adapters = _normalize_lora_adapters(job_input, explicit_fields)
+    lora_scale_mode = job_input.get("lora_scale_mode", "absolute")
 
     # Initialize pipeline if not already loaded
     if pipeline is None:
@@ -1117,12 +1396,24 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     )
 
     # Apply active LoRA adapter scales before each inference call.
-    _set_active_lora_adapters(pipeline, active_lora_adapters)
+    applied_main_loras = _set_active_lora_adapters(
+        pipeline,
+        active_lora_adapters,
+        scale_mode=lora_scale_mode,
+        scale_multiplier=1.0,
+    )
 
     print(
         f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-        f"guidance={guidance_scale}, shift={shift}, loras={len(active_lora_adapters)}"
+        f"guidance={guidance_scale}, shift={shift}, loras={len(applied_main_loras)}"
     )
+    if applied_main_loras:
+        print(
+            "Active LoRA weights: "
+            + ", ".join(
+                f"{item['adapter_name']}={item['effective_scale']:.4f}" for item in applied_main_loras
+            )
+        )
 
     # Generate images
     start_time = time.time()
@@ -1148,6 +1439,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     second_pass_strength = job_input.get("second_pass_strength", 0.2)
     second_pass_steps = job_input.get("second_pass_steps", 12)
     second_pass_guidance_scale = job_input.get("second_pass_guidance_scale", 1.0)
+    second_pass_lora_scale_multiplier = job_input.get("second_pass_lora_scale_multiplier", 1.0)
     enable_upscale = job_input.get("enable_upscale", False)
     upscale_factor = job_input.get("upscale_factor", 2.0)
     upscale_blend = job_input.get("upscale_blend", 0.35)
@@ -1164,6 +1456,8 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 shift=shift,
                 generator=generator,
                 lora_adapters=active_lora_adapters,
+                lora_scale_mode=lora_scale_mode,
+                lora_scale_multiplier=second_pass_lora_scale_multiplier,
             )
         if enable_upscale:
             img = tiled_upscale(
@@ -1180,6 +1474,15 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             "adapter_name": item["adapter_name"],
         }
         for item in active_lora_adapters
+    ]
+    applied_main_lora_metadata = [
+        {
+            "path": item["path"],
+            "scale": item["scale"],
+            "effective_scale": item["effective_scale"],
+            "adapter_name": item["adapter_name"],
+        }
+        for item in applied_main_loras
     ]
     single_lora = active_lora_metadata[0] if len(active_lora_metadata) == 1 else None
 
@@ -1214,6 +1517,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
                 "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
                 "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
+                "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
                 "upscale_blend": upscale_blend if enable_upscale else None,
@@ -1223,6 +1527,8 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 "lora_path": single_lora["path"] if single_lora else None,
                 "lora_scale": single_lora["scale"] if single_lora else None,
                 "loras": active_lora_metadata if active_lora_metadata else None,
+                "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None,
+                "lora_scale_mode": lora_scale_mode if active_lora_metadata else None,
                 "generation_time": f"{generation_time:.2f}s",
                 "preset": preset_name if preset_name else None,
                 "s3_bucket": S3_BUCKET_NAME,
@@ -1252,6 +1558,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
                 "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
                 "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
+                "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None,
                 "enable_upscale": enable_upscale,
                 "upscale_factor": upscale_factor if enable_upscale else None,
                 "upscale_blend": upscale_blend if enable_upscale else None,
@@ -1261,6 +1568,8 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 "lora_path": single_lora["path"] if single_lora else None,
                 "lora_scale": single_lora["scale"] if single_lora else None,
                 "loras": active_lora_metadata if active_lora_metadata else None,
+                "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None,
+                "lora_scale_mode": lora_scale_mode if active_lora_metadata else None,
                 "generation_time": f"{generation_time:.2f}s",
                 "preset": preset_name if preset_name else None,
             },
@@ -1284,8 +1593,9 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary with generated images or error message
     """
     try:
-        job_input = job.get("input", {})
-        explicit_fields = set(job_input.keys())
+        raw_job_input = job.get("input", {})
+        explicit_fields = set(raw_job_input.keys())
+        job_input = _preprocess_job_input(raw_job_input)
 
         # Validate input
         validation_result = validate(job_input, INPUT_SCHEMA)
