@@ -238,7 +238,7 @@ PRESETS = {
 
 pipeline: Optional[Flux2KleinPipeline] = None
 model_loaded = False
-lora_path_loaded: str = DEFAULT_LORA_PATH
+lora_adapters_loaded: List[Dict[str, str]] = []
 upscaler_model = None  # spandrel ImageModelDescriptor, loaded on first upscale request
 
 
@@ -303,6 +303,12 @@ INPUT_SCHEMA = {
         "required": False,
         "default": DEFAULT_LORA_SCALE,
         "constraints": lambda x: 0.0 <= x <= 2.0,
+    },
+    "loras": {
+        "type": list,
+        "required": False,
+        "default": [],
+        "constraints": lambda x: all(isinstance(item, dict) for item in x),
     },
     "output_format": {
         "type": str,
@@ -682,6 +688,87 @@ def _transfer_high_frequency_details(
     return Image.fromarray(mixed, "RGB")
 
 
+def _normalize_lora_adapters(job_input: Dict[str, Any], explicit_fields: set[str]) -> List[Dict[str, Any]]:
+    """Normalize LoRA request input into a list of adapter specs.
+
+    Supports backward-compatible single-LoRA fields (`lora_path`, `lora_scale`)
+    and the new multi-LoRA field (`loras`).
+    """
+    use_multi_lora = "loras" in explicit_fields
+
+    if use_multi_lora:
+        raw_loras = job_input.get("loras", [])
+        if raw_loras is None:
+            return []
+        if not isinstance(raw_loras, list):
+            raise ValueError("`loras` must be a list of objects")
+
+        normalized_loras: List[Dict[str, Any]] = []
+        for i, lora in enumerate(raw_loras):
+            if not isinstance(lora, dict):
+                raise ValueError(f"`loras[{i}]` must be an object")
+
+            path = lora.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(f"`loras[{i}].path` must be a non-empty string")
+
+            scale = lora.get("scale", DEFAULT_LORA_SCALE)
+            if not isinstance(scale, (int, float)):
+                raise ValueError(f"`loras[{i}].scale` must be a number")
+            scale = float(scale)
+            if not (0.0 <= scale <= 2.0):
+                raise ValueError(f"`loras[{i}].scale` must be between 0.0 and 2.0")
+
+            adapter_name = lora.get("adapter_name", f"flux_lora_{i}")
+            if not isinstance(adapter_name, str) or not adapter_name.strip():
+                raise ValueError(f"`loras[{i}].adapter_name` must be a non-empty string if provided")
+
+            normalized_loras.append(
+                {
+                    "path": path.strip(),
+                    "scale": scale,
+                    "adapter_name": adapter_name.strip(),
+                }
+            )
+
+        adapter_names = [item["adapter_name"] for item in normalized_loras]
+        if len(adapter_names) != len(set(adapter_names)):
+            raise ValueError("`loras` contains duplicate adapter_name values")
+
+        return normalized_loras
+
+    legacy_lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
+    if not isinstance(legacy_lora_path, str) or not legacy_lora_path.strip():
+        return []
+
+    legacy_lora_scale = float(job_input.get("lora_scale", DEFAULT_LORA_SCALE))
+    return [
+        {
+            "path": legacy_lora_path.strip(),
+            "scale": legacy_lora_scale,
+            "adapter_name": "flux_lora",
+        }
+    ]
+
+
+def _lora_stack_signature(lora_adapters: List[Dict[str, Any]]) -> tuple[tuple[str, str], ...]:
+    """Return a stable signature for loaded LoRA stack identity (path + adapter)."""
+    return tuple((item["path"], item["adapter_name"]) for item in lora_adapters)
+
+
+def _set_active_lora_adapters(
+    pipeline: Flux2KleinPipeline,
+    lora_adapters: List[Dict[str, Any]],
+) -> None:
+    """Apply active LoRA adapter names and scales to the pipeline."""
+    if not lora_adapters:
+        return
+
+    pipeline.set_adapters(
+        [item["adapter_name"] for item in lora_adapters],
+        adapter_weights=[item["scale"] for item in lora_adapters],
+    )
+
 def run_2nd_pass(
     image: Image.Image,
     prompt: str,
@@ -690,8 +777,7 @@ def run_2nd_pass(
     guidance_scale: float,
     shift: float,
     generator: torch.Generator,
-    lora_path_loaded: str,
-    lora_scale: float,
+    lora_adapters: List[Dict[str, Any]],
 ) -> Image.Image:
     """
     Conservative 2nd-pass detailer using FLUX2 image conditioning.
@@ -709,8 +795,7 @@ def run_2nd_pass(
         guidance_scale: CFG scale for the 2nd pass (keep low; ~1.0–1.3).
         shift: Flow-matching shift value (match 1st pass).
         generator: Seeded RNG — reused for deterministic pass sequencing.
-        lora_path_loaded: Loaded LoRA adapter name (empty if none).
-        lora_scale: LoRA adapter weight.
+        lora_adapters: Active LoRA adapters and scales.
 
     Returns:
         Refined PIL Image.
@@ -728,8 +813,7 @@ def run_2nd_pass(
         pipeline.scheduler.config,
         shift=shift,
     )
-    if lora_path_loaded:
-        pipeline.set_adapters("flux_lora", adapter_weights=lora_scale)
+    _set_active_lora_adapters(pipeline, lora_adapters)
 
     t0 = time.time()
     with torch.inference_mode():
@@ -761,23 +845,23 @@ def run_2nd_pass(
 def load_lora_weights(
     pipeline: Flux2KleinPipeline,
     lora_path: str,
-    lora_scale: float = 1.0
-) -> Flux2KleinPipeline:
+    adapter_name: str = "flux_lora",
+) -> tuple[Flux2KleinPipeline, bool]:
     """
     Load LoRA weights onto the pipeline.
 
     Args:
-        pipeline: The Flux2Klein pipeline
-        lora_path: Path, HuggingFace repo ID, or HTTPS URL for LoRA weights
-        lora_scale: Scaling factor for LoRA weights (0.0 to 2.0)
+        pipeline: The Flux2Klein pipeline.
+        lora_path: Path, HuggingFace repo ID, or HTTPS URL for LoRA weights.
+        adapter_name: Adapter name used to register this LoRA.
 
     Returns:
-        The pipeline with loaded LoRA weights
+        Tuple of (pipeline, load_success).
     """
     if not lora_path or lora_path.strip() == "":
         return pipeline, False
 
-    print(f"Loading LoRA weights from: {lora_path}")
+    print(f"Loading LoRA weights from: {lora_path} as adapter '{adapter_name}'")
 
     try:
         if lora_path.startswith(("http://", "https://")):
@@ -787,22 +871,26 @@ def load_lora_weights(
                 tmp_file = os.path.join(tmp_dir, "lora.safetensors")
                 urllib.request.urlretrieve(lora_path, tmp_file)
                 pipeline.load_lora_weights(
-                    tmp_dir, weight_name="lora.safetensors", adapter_name="flux_lora"
+                    tmp_dir,
+                    weight_name="lora.safetensors",
+                    adapter_name=adapter_name,
                 )
         elif os.path.exists(lora_path):
             if lora_path.endswith(".safetensors"):
                 lora_dir = os.path.dirname(lora_path) or "."
                 lora_name = os.path.basename(lora_path)
                 pipeline.load_lora_weights(
-                    lora_dir, weight_name=lora_name, adapter_name="flux_lora"
+                    lora_dir,
+                    weight_name=lora_name,
+                    adapter_name=adapter_name,
                 )
             else:
-                pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
+                pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
         else:
             # Load from HuggingFace Hub (repo ID)
-            pipeline.load_lora_weights(lora_path, adapter_name="flux_lora")
+            pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
 
-        print(f"LoRA weights loaded successfully")
+        print("LoRA weights loaded successfully")
         return pipeline, True
 
     except Exception as e:
@@ -814,19 +902,17 @@ def load_lora_weights(
 
 def initialize_pipeline(
     model_id: str = DEFAULT_MODEL_ID,
-    lora_path: str = "",
-    lora_scale: float = DEFAULT_LORA_SCALE,
-) -> Flux2KleinPipeline:
+    lora_adapters: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[Flux2KleinPipeline, List[Dict[str, str]]]:
     """
-    Initialize the Flux2Klein pipeline with optional LoRA weights.
+    Initialize the Flux2Klein pipeline with optional LoRA adapters.
 
     Args:
-        model_id: HuggingFace model ID or local path
-        lora_path: Optional path to LoRA weights
-        lora_scale: LoRA weight scaling factor
+        model_id: HuggingFace model ID or local path.
+        lora_adapters: Optional list of LoRA adapter specs.
 
     Returns:
-        Initialized Flux2KleinPipeline
+        Tuple of (initialized pipeline, loaded_lora_adapters).
     """
     global model_loaded
 
@@ -859,6 +945,7 @@ def initialize_pipeline(
         # "RuntimeError: A is not contiguous". qint8 uses a separate code
         # path with no Marlin dependency and the same ~8-bit storage savings.
         from optimum.quanto import freeze, qint8, quantize
+
         print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
         quantize(pipeline.transformer, weights=qint8)
         freeze(pipeline.transformer)
@@ -882,10 +969,28 @@ def initialize_pipeline(
     pipeline.vae.enable_slicing()
     pipeline.vae.enable_tiling()
 
-    # Load LoRA if specified — capture success flag so caller can track state
-    lora_ok = False
-    if lora_path:
-        pipeline, lora_ok = load_lora_weights(pipeline, lora_path, lora_scale)
+    loaded_lora_adapters: List[Dict[str, str]] = []
+    for lora in (lora_adapters or []):
+        pipeline, lora_ok = load_lora_weights(
+            pipeline,
+            lora["path"],
+            adapter_name=lora["adapter_name"],
+        )
+        if lora_ok:
+            loaded_lora_adapters.append(
+                {
+                    "path": lora["path"],
+                    "adapter_name": lora["adapter_name"],
+                }
+            )
+
+    loaded_keys = {(item["path"], item["adapter_name"]) for item in loaded_lora_adapters}
+    active_loras = [
+        item
+        for item in (lora_adapters or [])
+        if (item["path"], item["adapter_name"]) in loaded_keys
+    ]
+    _set_active_lora_adapters(pipeline, active_loras)
 
     # Warm up the pipeline
     print("Warming up pipeline...")
@@ -902,7 +1007,7 @@ def initialize_pipeline(
         print(f"Warning: Pipeline warmup failed: {e}")
 
     model_loaded = True
-    return pipeline, lora_ok
+    return pipeline, loaded_lora_adapters
 
 
 # ============================================================================
@@ -920,29 +1025,45 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     Returns:
         Dictionary containing generated images and metadata
     """
-    global pipeline, lora_path_loaded
+    global pipeline, lora_adapters_loaded
     explicit_fields = explicit_fields or set(job_input.keys())
+
+    requested_lora_adapters = _normalize_lora_adapters(job_input, explicit_fields)
 
     # Initialize pipeline if not already loaded
     if pipeline is None:
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
-        lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
-        lora_scale = job_input.get("lora_scale", DEFAULT_LORA_SCALE)
-        pipeline, lora_ok = initialize_pipeline(model_id, lora_path, lora_scale)
-        lora_path_loaded = lora_path if lora_ok else ""
+        pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
-    # Handle LoRA change without reloading the full pipeline
-    current_lora_path = job_input.get("lora_path", DEFAULT_LORA_PATH)
-    current_lora_scale = job_input.get("lora_scale", DEFAULT_LORA_SCALE)
+    # Handle LoRA stack changes without reloading the full pipeline
+    requested_signature = _lora_stack_signature(requested_lora_adapters)
+    loaded_signature = _lora_stack_signature(lora_adapters_loaded)
 
-    if current_lora_path != lora_path_loaded:
-        if lora_path_loaded:
+    if requested_signature != loaded_signature:
+        if lora_adapters_loaded:
             pipeline.unload_lora_weights()
-            lora_path_loaded = ""
-        if current_lora_path:
-            pipeline, lora_ok = load_lora_weights(pipeline, current_lora_path, current_lora_scale)
+            lora_adapters_loaded = []
+
+        for lora in requested_lora_adapters:
+            pipeline, lora_ok = load_lora_weights(
+                pipeline,
+                lora["path"],
+                adapter_name=lora["adapter_name"],
+            )
             if lora_ok:
-                lora_path_loaded = current_lora_path
+                lora_adapters_loaded.append(
+                    {
+                        "path": lora["path"],
+                        "adapter_name": lora["adapter_name"],
+                    }
+                )
+
+    loaded_keys = {(item["path"], item["adapter_name"]) for item in lora_adapters_loaded}
+    active_lora_adapters = [
+        item
+        for item in requested_lora_adapters
+        if (item["path"], item["adapter_name"]) in loaded_keys
+    ]
 
     # Extract parameters - apply preset first, then override with explicit values
     preset_name = job_input.get("preset", "realistic_character")
@@ -995,14 +1116,13 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         shift=shift,
     )
 
-    # Apply LoRA scale before each inference call.
-    # Only call set_adapters when the adapter is actually registered (lora_path_loaded
-    # is only set on successful load, so this guards against silent load failures).
-    if lora_path_loaded:
-        pipeline.set_adapters("flux_lora", adapter_weights=current_lora_scale)
+    # Apply active LoRA adapter scales before each inference call.
+    _set_active_lora_adapters(pipeline, active_lora_adapters)
 
-    print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-          f"guidance={guidance_scale}, shift={shift}")
+    print(
+        f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
+        f"guidance={guidance_scale}, shift={shift}, loras={len(active_lora_adapters)}"
+    )
 
     # Generate images
     start_time = time.time()
@@ -1043,8 +1163,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 guidance_scale=second_pass_guidance_scale,
                 shift=shift,
                 generator=generator,
-                lora_path_loaded=lora_path_loaded,
-                lora_scale=current_lora_scale,
+                lora_adapters=active_lora_adapters,
             )
         if enable_upscale:
             img = tiled_upscale(
@@ -1053,6 +1172,16 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
                 upscale_blend=upscale_blend,
             )
         processed_images.append(img)
+
+    active_lora_metadata = [
+        {
+            "path": item["path"],
+            "scale": item["scale"],
+            "adapter_name": item["adapter_name"],
+        }
+        for item in active_lora_adapters
+    ]
+    single_lora = active_lora_metadata[0] if len(active_lora_metadata) == 1 else None
 
     # Process output images
     return_type = job_input.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
@@ -1067,7 +1196,7 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             else:
                 # Fallback to base64 if S3 upload fails
                 image_urls.append(encode_image_to_base64(img, output_format))
-        
+
         response = {
             "image_urls": image_urls,
             "format": output_format,
@@ -1091,13 +1220,14 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
-                "lora_path": current_lora_path if current_lora_path else None,
-                "lora_scale": current_lora_scale if current_lora_path else None,
+                "lora_path": single_lora["path"] if single_lora else None,
+                "lora_scale": single_lora["scale"] if single_lora else None,
+                "loras": active_lora_metadata if active_lora_metadata else None,
                 "generation_time": f"{generation_time:.2f}s",
                 "preset": preset_name if preset_name else None,
                 "s3_bucket": S3_BUCKET_NAME,
                 "presigned_url_expiry_seconds": S3_PRESIGNED_URL_EXPIRY,
-            }
+            },
         }
     else:
         # Return base64 encoded images
@@ -1128,11 +1258,12 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             },
             "metadata": {
                 "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
-                "lora_path": current_lora_path if current_lora_path else None,
-                "lora_scale": current_lora_scale if current_lora_path else None,
+                "lora_path": single_lora["path"] if single_lora else None,
+                "lora_scale": single_lora["scale"] if single_lora else None,
+                "loras": active_lora_metadata if active_lora_metadata else None,
                 "generation_time": f"{generation_time:.2f}s",
                 "preset": preset_name if preset_name else None,
-            }
+            },
         }
 
     return response

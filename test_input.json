@@ -8,6 +8,7 @@
     "return_type": "s3",
     "lora_path": "",
     "lora_scale": 0.85,
+    "loras": [],
     "enable_2nd_pass": true,
     "second_pass_strength": 0.2,
     "second_pass_steps": 12,

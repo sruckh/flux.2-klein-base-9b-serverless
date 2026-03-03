@@ -23,6 +23,7 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement
 - **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap (16.7% ratio for seam-free output)
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
+- **Multi-LoRA Mixing** - Optional `loras` list to combine multiple adapters with independent weights (e.g., style + character)
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
 - **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts; upscaler model auto-downloaded and cached on first use
@@ -30,7 +31,7 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 
 ## 🏗️ Architecture
 
-The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization.
+The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization. Requests can use either a single legacy LoRA (`lora_path` + `lora_scale`) or a multi-LoRA stack (`loras` list).
 
 **FLUX.2-klein latent format:** The VAE uses **32 latent channels** (vs 16 in FLUX.1). The pipeline's internal latent representation is `(B, 128, H/16, W/16)` — a space-to-depth folding of the VAE output where 2×2 spatial blocks are folded into the channel dimension (`pixel_unshuffle(r=2)`), then flat-reshaped to a token sequence `(B, seq, 128)` for the transformer.
 
@@ -38,7 +39,7 @@ The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscret
 
 1. **Input Validation** — Parameters validated against schema, preset defaults applied
 2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + INT8 quantization + `.to("cuda")`; scheduler initialized with `shift=1.5`; VAE slicing/tiling enabled
-3. **LoRA Hot-Swap** — If `lora_path` changed since last request, unload previous and load new
+3. **LoRA Hot-Swap** — If requested adapter stack changed since last request, unload previous and load new adapters
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
 6. **2nd Pass Detailer** *(optional)* — Calls `Flux2KleinPipeline` again with the 1st pass image as the `image` conditioning input at low steps and low guidance. High-frequency detail from the refined result is blended back onto the 1st pass output via `_transfer_high_frequency_details()`, preserving identity and composition while adding skin pore and micro-contrast texture. LoRA stays active for subject consistency.
@@ -175,8 +176,18 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
   "input": {
     "prompt": "TOK woman, close-up portrait, soft window light, Sony A7IV, 105mm f/2.8, natural skin, visible pores, unretouched, ISO 800",
     "preset": "character_portrait_best",
-    "lora_path": "https://example.com/your-character-lora.safetensors",
-    "lora_scale": 0.85,
+    "loras": [
+      {
+        "path": "https://example.com/your-character-lora.safetensors",
+        "scale": 0.85,
+        "adapter_name": "character"
+      },
+      {
+        "path": "https://example.com/your-style-lora.safetensors",
+        "scale": 0.45,
+        "adapter_name": "style"
+      }
+    ],
     "guidance_scale": 2.2,
     "shift": 2.5,
     "seed": 42,
@@ -192,6 +203,17 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 }
 ```
 
+**Legacy single-LoRA input is still supported:**
+```json
+{
+  "input": {
+    "prompt": "TOK woman, close-up portrait, soft window light",
+    "lora_path": "https://example.com/your-character-lora.safetensors",
+    "lora_scale": 0.85
+  }
+}
+```
+
 **Response Format (S3 - default if configured):**
 ```json
 {
@@ -201,6 +223,12 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
   "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
+    "lora_path": null,
+    "lora_scale": null,
+    "loras": [
+      { "path": "https://example.com/your-character-lora.safetensors", "scale": 0.85, "adapter_name": "character" },
+      { "path": "https://example.com/your-style-lora.safetensors", "scale": 0.45, "adapter_name": "style" }
+    ],
     "generation_time": "12.34s",
     "preset": "portrait_hd",
     "s3_bucket": "your-bucket-name",
@@ -218,6 +246,9 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
   "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
     "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
+    "lora_path": null,
+    "lora_scale": null,
+    "loras": null,
     "generation_time": "12.34s",
     "preset": "portrait_hd"
   }
@@ -239,8 +270,9 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `num_images` | int | `1` | Number of images per request (1–4) |
 | `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
-| `lora_path` | string | `""` | HuggingFace repo ID, local path, or HTTPS URL to `.safetensors` |
-| `lora_scale` | float | `0.85` | LoRA weight scale (0.0–2.0); recommended 0.75–0.9; 1.0+ pushes identity too hard |
+| `loras` | list | `[]` | Optional multi-LoRA input. Each item: `{ "path": string, "scale": float, "adapter_name": string? }`; `adapter_name` defaults to `flux_lora_<index>` |
+| `lora_path` | string | `""` | Legacy single-LoRA path (used when `loras` is not provided) |
+| `lora_scale` | float | `0.85` | Legacy single-LoRA scale (0.0–2.0; used with `lora_path`) |
 | `max_sequence_length` | int | `512` | Maximum token length for text encoding (up to 512) |
 | **2nd Pass Detailer** | | | |
 | `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass after generation |
