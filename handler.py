@@ -1141,6 +1141,15 @@ def load_lora_weights(
 
     print(f"Loading LoRA weights from: {lora_path} as adapter '{adapter_name}'")
 
+    def _is_registered() -> bool:
+        """Return True if adapter_name is registered in any model component."""
+        return any(
+            hasattr(getattr(pipeline, attr, None), "peft_config")
+            and adapter_name in getattr(pipeline, attr).peft_config
+            for attr in ("transformer", "text_encoder", "text_encoder_2", "unet")
+            if hasattr(pipeline, attr)
+        )
+
     try:
         if lora_path.startswith(("http://", "https://")):
             # Download .safetensors from URL to a temporary directory
@@ -1153,31 +1162,37 @@ def load_lora_weights(
                     weight_name="lora.safetensors",
                     adapter_name=adapter_name,
                 )
+                if not _is_registered():
+                    # diffusers warning: "try specifying prefix=None" — the LoRA may use
+                    # different class-name prefixes (e.g. FLUX.1 vs FLUX.2-klein naming).
+                    print(f"No matching keys with default prefix; retrying with prefix=None for '{adapter_name}'...")
+                    pipeline.load_lora_weights(
+                        tmp_dir,
+                        weight_name="lora.safetensors",
+                        adapter_name=adapter_name,
+                        prefix=None,
+                    )
         elif os.path.exists(lora_path):
             if lora_path.endswith(".safetensors"):
                 lora_dir = os.path.dirname(lora_path) or "."
                 lora_name = os.path.basename(lora_path)
-                pipeline.load_lora_weights(
-                    lora_dir,
-                    weight_name=lora_name,
-                    adapter_name=adapter_name,
-                )
+                pipeline.load_lora_weights(lora_dir, weight_name=lora_name, adapter_name=adapter_name)
+                if not _is_registered():
+                    print(f"No matching keys with default prefix; retrying with prefix=None for '{adapter_name}'...")
+                    pipeline.load_lora_weights(lora_dir, weight_name=lora_name, adapter_name=adapter_name, prefix=None)
             else:
                 pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
+                if not _is_registered():
+                    print(f"No matching keys with default prefix; retrying with prefix=None for '{adapter_name}'...")
+                    pipeline.load_lora_weights(lora_path, adapter_name=adapter_name, prefix=None)
         else:
             # Load from HuggingFace Hub (repo ID)
             pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
+            if not _is_registered():
+                print(f"No matching keys with default prefix; retrying with prefix=None for '{adapter_name}'...")
+                pipeline.load_lora_weights(lora_path, adapter_name=adapter_name, prefix=None)
 
-        # Verify the adapter was actually registered in at least one model component.
-        # diffusers emits a warning (not an exception) when no matching LoRA keys are
-        # found in the file — the adapter name is never added to peft_config in that
-        # case, causing pipeline.set_adapters() to crash later with a KeyError.
-        components = [
-            getattr(pipeline, attr)
-            for attr in ("transformer", "text_encoder", "text_encoder_2", "unet")
-            if hasattr(pipeline, attr)
-        ]
-        if not any(hasattr(c, "peft_config") and adapter_name in c.peft_config for c in components):
+        if not _is_registered():
             print(
                 f"WARNING: LoRA file loaded but adapter '{adapter_name}' was not registered "
                 f"in any model component — file may be incompatible with Flux2KleinPipeline "
@@ -1347,19 +1362,40 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     loaded_signature = _lora_stack_signature(lora_adapters_loaded)
 
     if requested_signature != loaded_signature:
-        print(
-            f"LoRA stack changed (had {len(lora_adapters_loaded)}, "
-            f"need {len(requested_lora_adapters)}). Reinitializing pipeline."
-        )
-        import gc
-        # Release the existing pipeline before reinitializing to avoid holding
-        # two full model copies in VRAM simultaneously.
-        pipeline = None
-        lora_adapters_loaded = []
-        gc.collect()
-        torch.cuda.empty_cache()
-        model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
-        pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
+        loaded_set = set(loaded_signature)
+        requested_set = set(requested_signature)
+        stale = loaded_set - requested_set  # adapters loaded but no longer wanted
+
+        if stale:
+            # Loaded set has adapters from a previous request that aren't in the new
+            # request. Full reinit required (LoRAs must be loaded before CPU offload).
+            print(
+                f"LoRA stack changed (stale adapters: {len(stale)}, "
+                f"need: {len(requested_lora_adapters)}). Reinitializing pipeline."
+            )
+            import gc
+            pipeline = None
+            lora_adapters_loaded = []
+            gc.collect()
+            torch.cuda.empty_cache()
+            model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
+            pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
+        else:
+            # Loaded set is a subset of requested — some adapters are new or previously
+            # failed to load. Attempt inline loading for missing ones only.
+            missing = [
+                item for item in requested_lora_adapters
+                if (item["path"], item["adapter_name"]) not in loaded_set
+            ]
+            print(f"Loading {len(missing)} additional LoRA adapter(s) inline...")
+            for lora in missing:
+                pipeline, lora_ok = load_lora_weights(
+                    pipeline, lora["path"], adapter_name=lora["adapter_name"]
+                )
+                if lora_ok:
+                    lora_adapters_loaded.append(
+                        {"path": lora["path"], "adapter_name": lora["adapter_name"]}
+                    )
 
     loaded_keys = {(item["path"], item["adapter_name"]) for item in lora_adapters_loaded}
     active_lora_adapters = [
