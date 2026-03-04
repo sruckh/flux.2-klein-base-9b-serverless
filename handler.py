@@ -1172,7 +1172,9 @@ def load_lora_weights(
         return pipeline, True
 
     except Exception as e:
+        import traceback
         print(f"ERROR: Failed to load LoRA weights from '{lora_path}': {e}")
+        print(traceback.format_exc())
         # Continue without LoRA
 
     return pipeline, False
@@ -1229,24 +1231,12 @@ def initialize_pipeline(
         freeze(pipeline.transformer)
         print("int8 quantization complete")
 
-    if ENABLE_CPU_OFFLOAD:
-        print("Using model CPU offload")
-        pipeline.enable_model_cpu_offload()
-    else:
-        pipeline = pipeline.to(DEVICE)
-
-    # Set scheduler with shift=2.0 — default for photorealistic character output.
-    # Lower shift = more time at fine-detail timesteps = natural skin/texture.
-    # Overridden per-request in generate_images(); this value only affects warmup.
-    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipeline.scheduler.config,
-        shift=1.5,
-    )
-
-    # VAE memory optimizations
-    pipeline.vae.enable_slicing()
-    pipeline.vae.enable_tiling()
-
+    # Load LoRA weights BEFORE enabling CPU offload or moving to device.
+    # diffusers/PEFT require LoRA adapters to be attached while the model is
+    # in its base (pre-hook) state. Calling load_lora_weights after
+    # enable_model_cpu_offload() causes accelerate's offload hooks to
+    # interfere with PEFT adapter registration, silently failing on the
+    # second and subsequent adapters.
     loaded_lora_adapters: List[Dict[str, str]] = []
     for lora in (lora_adapters or []):
         pipeline, lora_ok = load_lora_weights(
@@ -1269,6 +1259,24 @@ def initialize_pipeline(
         if (item["path"], item["adapter_name"]) in loaded_keys
     ]
     _set_active_lora_adapters(pipeline, active_loras)
+
+    if ENABLE_CPU_OFFLOAD:
+        print("Using model CPU offload")
+        pipeline.enable_model_cpu_offload()
+    else:
+        pipeline = pipeline.to(DEVICE)
+
+    # Set scheduler with shift=2.0 — default for photorealistic character output.
+    # Lower shift = more time at fine-detail timesteps = natural skin/texture.
+    # Overridden per-request in generate_images(); this value only affects warmup.
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+        pipeline.scheduler.config,
+        shift=1.5,
+    )
+
+    # VAE memory optimizations
+    pipeline.vae.enable_slicing()
+    pipeline.vae.enable_tiling()
 
     # Warm up the pipeline
     print("Warming up pipeline...")
@@ -1314,28 +1322,20 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
         pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
-    # Handle LoRA stack changes without reloading the full pipeline
+    # Handle LoRA stack changes.
+    # LoRAs must be loaded before enable_model_cpu_offload() — PEFT adapter
+    # registration conflicts with accelerate's offload hooks if done after.
+    # Reinitializing the full pipeline is the only safe path on a warm worker.
     requested_signature = _lora_stack_signature(requested_lora_adapters)
     loaded_signature = _lora_stack_signature(lora_adapters_loaded)
 
     if requested_signature != loaded_signature:
-        if lora_adapters_loaded:
-            pipeline.unload_lora_weights()
-            lora_adapters_loaded = []
-
-        for lora in requested_lora_adapters:
-            pipeline, lora_ok = load_lora_weights(
-                pipeline,
-                lora["path"],
-                adapter_name=lora["adapter_name"],
-            )
-            if lora_ok:
-                lora_adapters_loaded.append(
-                    {
-                        "path": lora["path"],
-                        "adapter_name": lora["adapter_name"],
-                    }
-                )
+        print(
+            f"LoRA stack changed (had {len(lora_adapters_loaded)}, "
+            f"need {len(requested_lora_adapters)}). Reinitializing pipeline."
+        )
+        model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
+        pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
     loaded_keys = {(item["path"], item["adapter_name"]) for item in lora_adapters_loaded}
     active_lora_adapters = [

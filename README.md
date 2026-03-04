@@ -16,14 +16,14 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **FLUX.2-klein-base-9B** - Undistilled 9B-parameter flow-match transformer by Black Forest Labs
 - **Flux2KleinPipeline** - Correct pipeline class via git diffusers (not available in stable releases)
 - **Custom LoRA Support** - Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
-- **LoRA Hot-Swap** - Switch LoRA between requests without reloading the base model
+- **Multi-LoRA Mixing** - Load multiple LoRA adapters simultaneously with independent per-adapter weights
 - **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
 - **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture, plus character LoRA-optimized presets
 - **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
 - **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement
 - **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap (16.7% ratio for seam-free output)
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
-- **Multi-LoRA Mixing** - Optional `loras` list to combine multiple adapters with independent weights (e.g., style + character)
+- **LoRA Stack Switching** - When the requested LoRA set changes between requests, the pipeline reinitializes to safely load new adapters before CPU offload hooks are attached
 - **Multiple Output Formats** - PNG, JPEG, WebP support
 - **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
 - **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts; upscaler model auto-downloaded and cached on first use
@@ -31,15 +31,15 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 
 ## 🏗️ Architecture
 
-The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA weights are hot-swapped per request using `unload_lora_weights()` + reload, avoiding full model reinitialization. Requests can use either a single legacy LoRA (`lora_path` + `lora_scale`) or a multi-LoRA stack (`loras` list).
+The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA adapters are loaded **before** `enable_model_cpu_offload()` is called — this is required because PEFT adapter registration conflicts with accelerate's offload hooks if done after. When the requested LoRA stack changes between requests, the full pipeline reinitializes to preserve this ordering. Requests can use either a single legacy LoRA (`lora_path` + `lora_scale`) or a multi-LoRA stack (`loras` list).
 
 **FLUX.2-klein latent format:** The VAE uses **32 latent channels** (vs 16 in FLUX.1). The pipeline's internal latent representation is `(B, 128, H/16, W/16)` — a space-to-depth folding of the VAE output where 2×2 spatial blocks are folded into the channel dimension (`pixel_unshuffle(r=2)`), then flat-reshaped to a token sequence `(B, seq, 128)` for the transformer.
 
 ### Data Flow Pipeline
 
 1. **Input Validation** — Parameters validated against schema, preset defaults applied
-2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + INT8 quantization + `.to("cuda")`; scheduler initialized with `shift=1.5`; VAE slicing/tiling enabled
-3. **LoRA Hot-Swap** — If requested adapter stack changed since last request, unload previous and load new adapters
+2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + INT8 quantization; **LoRA adapters loaded here** (before CPU offload/device placement); `enable_model_cpu_offload()` or `.to("cuda")`; scheduler initialized with `shift=1.5`; VAE slicing/tiling enabled
+3. **LoRA Stack Check** — If requested adapter stack differs from what is loaded, pipeline reinitializes (same sequence as step 2) to safely load the new adapters before offload hooks are attached
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
 6. **2nd Pass Detailer** *(optional)* — Calls `Flux2KleinPipeline` again with the 1st pass image as the `image` conditioning input at low steps and low guidance. High-frequency detail from the refined result is blended back onto the 1st pass output via `_transfer_high_frequency_details()`, preserving identity and composition while adding skin pore and micro-contrast texture. LoRA stays active for subject consistency.
