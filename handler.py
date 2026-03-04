@@ -1334,6 +1334,13 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             f"LoRA stack changed (had {len(lora_adapters_loaded)}, "
             f"need {len(requested_lora_adapters)}). Reinitializing pipeline."
         )
+        import gc
+        # Release the existing pipeline before reinitializing to avoid holding
+        # two full model copies in VRAM simultaneously.
+        pipeline = None
+        lora_adapters_loaded = []
+        gc.collect()
+        torch.cuda.empty_cache()
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
         pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
