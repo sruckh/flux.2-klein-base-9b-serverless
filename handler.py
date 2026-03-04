@@ -1168,7 +1168,24 @@ def load_lora_weights(
             # Load from HuggingFace Hub (repo ID)
             pipeline.load_lora_weights(lora_path, adapter_name=adapter_name)
 
-        print("LoRA weights loaded successfully")
+        # Verify the adapter was actually registered in at least one model component.
+        # diffusers emits a warning (not an exception) when no matching LoRA keys are
+        # found in the file — the adapter name is never added to peft_config in that
+        # case, causing pipeline.set_adapters() to crash later with a KeyError.
+        components = [
+            getattr(pipeline, attr)
+            for attr in ("transformer", "text_encoder", "text_encoder_2", "unet")
+            if hasattr(pipeline, attr)
+        ]
+        if not any(hasattr(c, "peft_config") and adapter_name in c.peft_config for c in components):
+            print(
+                f"WARNING: LoRA file loaded but adapter '{adapter_name}' was not registered "
+                f"in any model component — file may be incompatible with Flux2KleinPipeline "
+                f"(no matching LoRA keys found). Treating as load failure."
+            )
+            return pipeline, False
+
+        print(f"LoRA weights loaded successfully as adapter '{adapter_name}'")
         return pipeline, True
 
     except Exception as e:
