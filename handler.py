@@ -1,6 +1,6 @@
 """
 RunPod Serverless Handler for FLUX.2-klein-base-9B with LoRA Support
-General-purpose multi-LoRA implementation.
+Based on ai-toolkit by ostris
 """
 
 import base64
@@ -46,6 +46,7 @@ upscaler_model = None
 
 PRESETS = {
     "realistic_character": {"num_inference_steps": 35, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1024},
+    "manga_style": {"num_inference_steps": 25, "guidance_scale": 1.0, "shift": 1.5, "width": 1024, "height": 1024},
     "portrait_hd": {"num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1536},
     "character_portrait_best": {"num_inference_steps": 45, "guidance_scale": 2.2, "shift": 2.5, "width": 1024, "height": 1024},
 }
@@ -64,25 +65,38 @@ INPUT_SCHEMA = {
     "output_format": {"type": str, "required": False, "default": "jpeg"},
     "return_type": {"type": str, "required": False, "default": "s3"},
     "shift": {"type": float, "required": False, "default": 1.5},
+    "max_sequence_length": {"type": int, "required": False, "default": 512},
     "enable_2nd_pass": {"type": bool, "required": False, "default": False},
     "second_pass_strength": {"type": float, "required": False, "default": 0.2},
+    "second_pass_steps": {"type": int, "required": False, "default": 12},
+    "second_pass_guidance_scale": {"type": float, "required": False, "default": 1.0},
+    "second_pass_lora_scale_multiplier": {"type": float, "required": False, "default": 1.0},
     "enable_upscale": {"type": bool, "required": False, "default": False},
     "upscale_factor": {"type": float, "required": False, "default": 2.0},
     "upscale_blend": {"type": float, "required": False, "default": 0.35},
+    "lora_path": {"type": str, "required": False, "default": ""},
+    "lora_url": {"type": str, "required": False, "default": ""},
+    "lora_scale": {"type": float, "required": False, "default": 0.85},
+    "additional_lora": {"type": str, "required": False, "default": ""},
+    "additional_lora_path": {"type": str, "required": False, "default": ""},
+    "additional_lora_url": {"type": str, "required": False, "default": ""},
+    "additional_lora_scale": {"type": float, "required": False, "default": 0.85},
+    "additional_lora_strength": {"type": float, "required": False, "default": 0.85},
 }
 
-def _preprocess_job_input(ji):
+def _preprocess_job_input(ji: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(ji, dict): return ji
     ji = dict(ji)
-    for k in ["lora_scale", "additional_lora_strength", "additional_lora_scale"]:
-        if k in ji and isinstance(ji[k], str):
+    fkeys = ["lora_scale", "additional_lora_strength", "additional_lora_scale", "second_pass_lora_scale_multiplier"]
+    for k in fkeys:
+        if k in ji and isinstance(ji[k], str) and ji[k].strip():
             try: ji[k] = float(ji[k].strip())
             except: pass
     if isinstance(ji.get("loras"), list):
         for item in ji["loras"]:
             if isinstance(item, dict):
-                for sk in ("scale", "strength", "weight"):
-                    if sk in item and isinstance(item[sk], str):
+                for sk in ("scale", "strength", "weight", "lora_scale"):
+                    if sk in item and isinstance(item[sk], str) and item[sk].strip():
                         try: item[sk] = float(item[sk].strip())
                         except: pass
     return ji
@@ -108,15 +122,15 @@ def encode_base64(image, fmt):
     image.save(buf, format="JPEG", quality=80, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def _set_loras(pipe, adapters, mode="absolute"):
+def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if not adapters: return []
-    applied = []
-    scales = [float(a["scale"]) for a in adapters]
+    scales = [float(a["scale"]) * multiplier for a in adapters]
     if mode == "normalized" and sum(scales) > 0:
         total = sum(scales)
         scales = [s / total for s in scales]
     
     names = [a["adapter_name"] for a in adapters]
+    applied = []
     for i, (name, scale) in enumerate(zip(names, scales)):
         applied.append({"adapter_name": name, "effective_scale": scale, "path": adapters[i]["path"]})
         
@@ -125,7 +139,6 @@ def _set_loras(pipe, adapters, mode="absolute"):
         if comp is not None and hasattr(comp, "set_adapters"):
             try:
                 comp.set_adapters(names, adapter_weights=scales)
-                # Manual forcing of scales into PEFT internal scaling dicts
                 for m in comp.modules():
                     if hasattr(m, "scaling") and hasattr(m, "adapter_name") and m.adapter_name in names:
                         m.scaling[m.adapter_name] = scales[names.index(m.adapter_name)]
@@ -134,22 +147,20 @@ def _set_loras(pipe, adapters, mode="absolute"):
 
 def initialize_pipeline(model_id, adapters=None):
     vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    # Stable FP8 precision for 24GB+ GPUs
     use_quant = vram < 40.0
-    print(f"Loading {model_id} (VRAM: {vram:.1f}GB, Quant: {use_quant})")
+    print(f"Loading {model_id} (VRAM: {vram:.1f}GB, Quantized: {use_quant})")
     pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, token=HF_TOKEN or None)
 
     if use_quant:
         try:
             import optimum.quanto
             from optimum.quanto import freeze, quantize
-            # Standard safe types for optimum-quanto
-            qtype = getattr(optimum.quanto, "qfloat8", torch.float8_e4m3fn)
+            qtype = getattr(optimum.quanto, "qfloat8", torch.float8_e4m3fn) if vram >= 22.0 else getattr(optimum.quanto, "qint8", torch.int8)
             print(f"Quantizing to {qtype}...")
             quantize(pipe.transformer, weights=qtype)
             freeze(pipe.transformer)
         except Exception as e:
-            print(f"Quantization fallback to BF16: {e}")
+            print(f"Quantization failed: {e}")
 
     loaded = []
     for l in (adapters or []):
@@ -171,19 +182,27 @@ def initialize_pipeline(model_id, adapters=None):
 
 def generate_images(ji, ef):
     global pipeline, lora_adapters_loaded
+    # Normalize/Restore LoRA logic
     req_loras = []
     if "loras" in ef:
         for i, l in enumerate(ji.get("loras", [])):
             p = l.get("path") or l.get("url") or l.get("lora_url") or l.get("lora_path")
-            if p: req_loras.append({"path": p, "scale": float(l.get("scale", 0.85)), "adapter_name": l.get("adapter_name", f"l_{i}")})
-    
+            if p: req_loras.append({"path": p, "scale": float(l.get("scale") or l.get("strength") or l.get("weight") or 0.85), "adapter_name": l.get("adapter_name", f"l_{i}")})
+    else:
+        lp = (ji.get("lora_path") or ji.get("lora_url") or "").strip()
+        if lp: req_loras.append({"path": lp, "scale": float(ji.get("lora_scale", 0.85)), "adapter_name": "l_0"})
+        alp = (ji.get("additional_lora") or ji.get("additional_lora_path") or ji.get("additional_lora_url") or "").strip()
+        if alp: req_loras.append({"path": alp, "scale": float(ji.get("additional_lora_scale") or ji.get("additional_lora_strength") or 0.85), "adapter_name": "l_1"})
+
     sig = lambda x: tuple((y["path"], y["adapter_name"]) for y in x)
     if pipeline is None or sig(req_loras) != sig(lora_adapters_loaded):
         import gc; pipeline = None; lora_adapters_loaded = []; gc.collect(); torch.cuda.empty_cache()
         pipeline, lora_adapters_loaded = initialize_pipeline(ji.get("model_id", DEFAULT_MODEL_ID), req_loras)
 
-    preset = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"])
-    w, h, steps, cfg, shift = ji.get("width", preset["width"]), ji.get("height", preset["height"]), ji.get("num_inference_steps", preset["num_inference_steps"]), ji.get("guidance_scale", preset["guidance_scale"]), ji.get("shift", preset["shift"])
+    p = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
+    w, h = ji.get("width") or p["width"], ji.get("height") or p["height"]
+    steps, cfg, shift = ji.get("num_inference_steps") or p["num_inference_steps"], ji.get("guidance_scale") or p["guidance_scale"], ji.get("shift") or p["shift"]
+    max_seq_len = ji.get("max_sequence_length", 512)
     
     seed = ji.get("seed", -1)
     if seed < 0: seed = int(time.time() * 1000) % (2**31)
@@ -191,18 +210,19 @@ def generate_images(ji, ef):
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config, shift=shift)
     applied = _set_loras(pipeline, lora_adapters_loaded, mode=ji.get("lora_scale_mode", "absolute"))
     
+    print(f"Inference: {w}x{h}, {steps} steps, CFG {cfg}")
     start = time.time()
     with torch.inference_mode():
-        res = pipeline(prompt=ji["prompt"], width=w, height=h, num_inference_steps=steps, guidance_scale=cfg, generator=torch.Generator(DEVICE).manual_seed(seed), num_images_per_prompt=ji.get("num_images", 1))
+        res = pipeline(prompt=ji["prompt"], width=w, height=h, num_inference_steps=steps, guidance_scale=cfg, generator=torch.Generator(DEVICE).manual_seed(seed), num_images_per_prompt=ji.get("num_images", 1), max_sequence_length=max_seq_len)
     
     final = []
     for img in res.images:
-        # Detailer and Upscaler Logic
         if ji.get("enable_2nd_pass"):
-            _set_loras(pipeline, lora_adapters_loaded, mode=ji.get("lora_scale_mode", "absolute"))
+            _set_loras(pipeline, lora_adapters_loaded, multiplier=ji.get("second_pass_lora_scale_multiplier", 1.0))
             with torch.inference_mode():
-                refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=12, guidance_scale=1.0).images[0]
-            b_np, r_rgb = np.asarray(img.convert("RGB"), dtype=np.float32), refined.convert("RGB")
+                refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 12), guidance_scale=ji.get("second_pass_guidance_scale", 1.0)).images[0]
+            b_np = np.asarray(img.convert("RGB"), dtype=np.float32)
+            r_rgb = refined.convert("RGB")
             r_low = np.asarray(r_rgb.filter(ImageFilter.GaussianBlur(1.25)), dtype=np.float32)
             diff = (np.asarray(r_rgb, dtype=np.float32) - r_low) * ji.get("second_pass_strength", 0.2)
             img = Image.fromarray(np.clip(b_np + diff, 0, 255).astype(np.uint8))
@@ -216,7 +236,8 @@ def generate_images(ji, ef):
                 t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
                 with torch.inference_mode(): out = upscaler_model(t).cpu().clamp(0, 1)
                 img = Image.fromarray((out.squeeze(0).permute(1, 2, 0).numpy() * 255).round().astype(np.uint8))
-                img = img.resize((int(w * ji.get("upscale_factor", 2.0)), int(h * ji.get("upscale_factor", 2.0))), Image.LANCZOS)
+                tw, th = int(w * ji.get("upscale_factor", 2.0)), int(h * ji.get("upscale_factor", 2.0))
+                img = img.resize((tw, th), Image.LANCZOS)
         final.append(img)
 
     fmt = ji.get("output_format", "jpeg")
@@ -230,7 +251,7 @@ def generate_images(ji, ef):
             if u: urls.append(u)
             else:
                 b64 = encode_base64(i, fmt)
-                if len(b64) > 1_800_000: return {"error": "S3 Upload Failed. Base64 too large for RunPod API."}
+                if len(b64) > 1_800_000: return {"error": "S3 Failed and Base64 > 2MB limit."}
                 urls.append(b64)
         return {"image_urls": urls, "metadata": meta}
     return {"images": [encode_base64(i, fmt) for i in final], "metadata": meta}
@@ -239,14 +260,12 @@ def handler(job):
     try:
         raw = job.get("input", {})
         ji = _preprocess_job_input(raw)
-        v = validate(ji, INPUT_SCHEMA)
-        if "errors" in v: return {"error": str(v["errors"])}
-        return generate_images(v["validated_input"], set(raw.keys()))
+        val = validate(ji, INPUT_SCHEMA)
+        if "errors" in val: return {"error": str(val["errors"])}
+        return generate_images(val["validated_input"], set(raw.keys()))
     except Exception as e:
         import traceback
-        err_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"ERROR: {err_msg}")
-        return {"error": err_msg, "traceback": traceback.format_exc()}
+        return {"error": f"{type(e).__name__}: {str(e)}", "traceback": traceback.format_exc()}
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
