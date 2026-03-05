@@ -28,6 +28,7 @@ from runpod.serverless.utils.rp_validator import validate
 # Configuration & Constants
 # ============================================================================
 
+from huggingface_hub import hf_hub_download
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "")
@@ -129,14 +130,21 @@ def _preprocess_job_input(ji: Dict[str, Any]) -> Dict[str, Any]:
     return ji
 
 def ensure_models():
-    if not os.path.exists(MODEL_BASE_DIR): os.makedirs(MODEL_BASE_DIR, exist_ok=True)
+    os.makedirs(MODEL_BASE_DIR, exist_ok=True)
     paths = {}
     for key, url in MODEL_URLS.items():
-        local_path = os.path.join(MODEL_BASE_DIR, url.split("/")[-1])
-        paths[key] = local_path
-        if not os.path.exists(local_path):
-            print(f"Downloading {key}...")
-            urllib.request.urlretrieve(url, local_path)
+        after_hf = url.replace("https://huggingface.co/", "")
+        repo_id, file_path = after_hf.split("/resolve/main/", 1)
+        parts = file_path.rsplit("/", 1)
+        subfolder, filename = (parts[0], parts[1]) if len(parts) == 2 else (None, parts[0])
+        print(f"Ensuring {key}...")
+        paths[key] = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            subfolder=subfolder,
+            local_dir=MODEL_BASE_DIR,
+            token=HF_TOKEN or None,
+        )
     return paths
 
 def get_s3_client():
