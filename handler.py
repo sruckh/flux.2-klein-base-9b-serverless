@@ -1029,10 +1029,26 @@ def _set_active_lora_adapters(
             }
         )
 
-    pipeline.set_adapters(
-        [item["adapter_name"] for item in applied],
-        adapter_weights=[item["effective_scale"] for item in applied],
-    )
+    # Explicitly set adapters on all relevant components to bypass potential
+    # delegation bugs in the pipeline class.
+    active_names = [item["adapter_name"] for item in applied]
+    active_weights = [item["effective_scale"] for item in applied]
+    
+    components = ["transformer", "text_encoder", "text_encoder_2"]
+    for name in components:
+        comp = getattr(pipeline, name, None)
+        if comp is not None and hasattr(comp, "set_adapters"):
+            try:
+                comp.set_adapters(active_names, adapter_weights=active_weights)
+            except Exception as e:
+                print(f"Warning: Failed to set LoRA adapters on {name}: {e}")
+
+    # Still call on the pipeline for global consistency
+    try:
+        pipeline.set_adapters(active_names, adapter_weights=active_weights)
+    except Exception:
+        pass
+
     return applied
 
 def run_2nd_pass(
@@ -1251,11 +1267,29 @@ def initialize_pipeline(
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
     # -------------------------------------------------------------------------
-    # 1. Load LoRA weights BEFORE quantization and BEFORE CPU offload.
-    # diffusers/PEFT require LoRA adapters to be attached while the model is
-    # in its base (unquantized, pre-hook) state. Attaching LoRAs to already-
-    # quantized layers or after offload hooks are attached causes silent 
-    # failure where the adapter is registered but has zero impact.
+    # 1. Quantize the transformer FIRST.
+    # optimum-quanto replaces Linear layers with QuantoLinear. We MUST do this
+    # before loading LoRAs so that the LoRA layers can properly wrap the 
+    # already-quantized base layers.
+    # -------------------------------------------------------------------------
+    if dtype == torch.float8_e4m3fn:
+        # Use qint8 instead of qfloat8. The qfloat8 path in optimum-quanto
+        # packs weights into MarlinF8QBytesTensor on CUDA, which requires
+        # contiguous inputs — diffusers does not guarantee this, causing
+        # "RuntimeError: A is not contiguous". qint8 uses a separate code
+        # path with no Marlin dependency and the same ~8-bit storage savings.
+        from optimum.quanto import freeze, qint8, quantize
+
+        print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
+        quantize(pipeline.transformer, weights=qint8)
+        freeze(pipeline.transformer)
+        print("int8 quantization complete")
+
+    # -------------------------------------------------------------------------
+    # 2. Load LoRA weights AFTER quantization but BEFORE CPU offload.
+    # diffusers/PEFT require LoRA adapters to be attached before offload
+    # hooks are attached. Now that the model is quantized, PEFT will 
+    # wrap the QuantoLinear layers.
     # -------------------------------------------------------------------------
     loaded_lora_adapters: List[Dict[str, str]] = []
     for lora in (lora_adapters or []):
@@ -1279,19 +1313,6 @@ def initialize_pipeline(
         if (item["path"], item["adapter_name"]) in loaded_keys
     ]
     _set_active_lora_adapters(pipeline, active_loras)
-
-    # -------------------------------------------------------------------------
-    # 2. Quantize the transformer.
-    # optimum-quanto replaces Linear layers with QuantoLinear. Since we 
-    # attached LoRAs above, the LoRA layers will now wrap the quantized base.
-    # -------------------------------------------------------------------------
-    if dtype == torch.float8_e4m3fn:
-        from optimum.quanto import freeze, qint8, quantize
-
-        print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
-        quantize(pipeline.transformer, weights=qint8)
-        freeze(pipeline.transformer)
-        print("int8 quantization complete")
 
     if ENABLE_CPU_OFFLOAD:
         print("Using model CPU offload")
