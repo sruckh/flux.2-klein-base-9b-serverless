@@ -205,11 +205,19 @@ def initialize_pipeline(adapters=None):
         token=HF_TOKEN or None,
     )
 
-    # Transformer: FP8 distilled single-file checkpoint
-    transformer = FluxTransformer2DModel.from_single_file(
-        paths["transformer"],
-        torch_dtype=torch.float8_e4m3fn,
+    # Transformer: FP8 distilled single-file checkpoint (already in diffusers key format).
+    # from_single_file fails because its converter expects original BFL keys (time_in.*)
+    # which don't exist in this checkpoint → KeyError: 'time_in.in_layer.bias'.
+    # Fix: bootstrap config from the base repo, init on meta device, then load weights directly.
+    transformer_config = FluxTransformer2DModel.load_config(
+        "black-forest-labs/FLUX.2-klein-9B",
+        subfolder="transformer",
+        token=HF_TOKEN or None,
     )
+    with torch.device("meta"):
+        transformer = FluxTransformer2DModel.from_config(transformer_config)
+    tr_sd = load_safetensors(paths["transformer"])
+    transformer.load_state_dict(tr_sd, strict=True, assign=True)
 
     # Text encoder: abliterated Qwen3-8B weights, config bootstrapped from official repo.
     # edicamargo repo has weights only (no config.json), so we init from Qwen/Qwen3-8B-FP8
