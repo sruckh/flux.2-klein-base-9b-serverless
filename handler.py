@@ -727,10 +727,11 @@ def _transfer_high_frequency_details(
     blur_radius: float = 1.25,
 ) -> Image.Image:
     """
-    Transfer only micro-detail from refined_image onto base_image.
+    Inject high-frequency detail from refined_image onto base_image.
 
-    This keeps identity, framing, color balance, and overall style from the
-    first pass while adding texture from a second generative pass.
+    Uses a non-destructive detail-injection method (similar to high-pass overlay)
+    that preserves the base image's colors, lighting, and style while adding
+    the sharpness and texture discovered in the second pass.
     """
     amount = float(max(0.0, min(1.0, amount)))
     if amount <= 0.0:
@@ -742,14 +743,19 @@ def _transfer_high_frequency_details(
     base_np = np.asarray(base_rgb, dtype=np.float32)
     refined_np = np.asarray(refined_rgb, dtype=np.float32)
 
-    # High-frequency band from each image via Gaussian low-pass subtraction.
-    base_low = np.asarray(base_rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32)
-    refined_low = np.asarray(refined_rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32)
-    base_high = base_np - base_low
-    refined_high = refined_np - refined_low
+    # Extract the "detail layer" from the refined image: 
+    # (Refined Image - Blurred Version) = Only Sharp Edges/Textures
+    refined_low = np.asarray(
+        refined_rgb.filter(ImageFilter.GaussianBlur(radius=blur_radius)), 
+        dtype=np.float32
+    )
+    detail_layer = refined_np - refined_low
 
-    # Inject only incremental detail differences from refined into base.
-    mixed = base_np + amount * (refined_high - base_high)
+    # Inject the detail into the base image.
+    # We add the detail difference weighted by the 'amount' parameter.
+    mixed = base_np + (detail_layer * amount)
+    
+    # Clip to valid color range
     mixed = np.clip(mixed, 0.0, 255.0).astype(np.uint8)
     return Image.fromarray(mixed, "RGB")
 
