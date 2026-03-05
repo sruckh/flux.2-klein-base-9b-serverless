@@ -26,6 +26,7 @@ from runpod.serverless.utils.rp_validator import validate
 
 # Environment Config
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Marlin kernels for FP8 are currently buggy in this environment (contiguity errors)
 os.environ["QUANTO_DISABLE_MARLIN"] = "1"
 
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
@@ -46,9 +47,9 @@ upscaler_model = None
 
 PRESETS = {
     "realistic_character": {"num_inference_steps": 35, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1024},
-    "manga_style": {"num_inference_steps": 25, "guidance_scale": 1.0, "shift": 1.5, "width": 1024, "height": 1024},
     "portrait_hd": {"num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1536},
     "character_portrait_best": {"num_inference_steps": 45, "guidance_scale": 2.2, "shift": 2.5, "width": 1024, "height": 1024},
+    "manga_style": {"num_inference_steps": 25, "guidance_scale": 1.0, "shift": 1.5, "width": 1024, "height": 1024},
 }
 
 INPUT_SCHEMA = {
@@ -89,15 +90,15 @@ def _preprocess_job_input(ji: Dict[str, Any]) -> Dict[str, Any]:
     ji = dict(ji)
     fkeys = ["lora_scale", "additional_lora_strength", "additional_lora_scale", "second_pass_lora_scale_multiplier"]
     for k in fkeys:
-        if k in ji and isinstance(ji[k], str) and ji[k].strip():
-            try: ji[k] = float(ji[k].strip())
+        if k in ji and isinstance(ji[k], (str, float, int)):
+            try: ji[k] = float(str(ji[k]).strip())
             except: pass
     if isinstance(ji.get("loras"), list):
         for item in ji["loras"]:
             if isinstance(item, dict):
                 for sk in ("scale", "strength", "weight", "lora_scale"):
-                    if sk in item and isinstance(item[sk], str) and item[sk].strip():
-                        try: item[sk] = float(item[sk].strip())
+                    if sk in item and isinstance(item[sk], (str, float, int)):
+                        try: item[sk] = float(str(item[sk]).strip())
                         except: pass
     return ji
 
@@ -128,12 +129,10 @@ def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if mode == "normalized" and sum(scales) > 0:
         total = sum(scales)
         scales = [s / total for s in scales]
-    
     names = [a["adapter_name"] for a in adapters]
     applied = []
     for i, (name, scale) in enumerate(zip(names, scales)):
         applied.append({"adapter_name": name, "effective_scale": scale, "path": adapters[i]["path"]})
-        
     for comp_name in ["transformer", "text_encoder", "text_encoder_2"]:
         comp = getattr(pipe, comp_name, None)
         if comp is not None and hasattr(comp, "set_adapters"):
@@ -153,14 +152,12 @@ def initialize_pipeline(model_id, adapters=None):
 
     if use_quant:
         try:
-            import optimum.quanto
-            from optimum.quanto import freeze, quantize
-            qtype = getattr(optimum.quanto, "qfloat8", torch.float8_e4m3fn) if vram >= 22.0 else getattr(optimum.quanto, "qint8", torch.int8)
-            print(f"Quantizing to {qtype}...")
-            quantize(pipe.transformer, weights=qtype)
+            from optimum.quanto import freeze, quantize, qint8
+            print("Quantizing transformer to int8 (Stable Path)...")
+            quantize(pipe.transformer, weights=qint8)
             freeze(pipe.transformer)
         except Exception as e:
-            print(f"Quantization failed: {e}")
+            print(f"Quantization failed, falling back to BF16: {e}")
 
     loaded = []
     for l in (adapters or []):
@@ -182,7 +179,6 @@ def initialize_pipeline(model_id, adapters=None):
 
 def generate_images(ji, ef):
     global pipeline, lora_adapters_loaded
-    # Normalize/Restore LoRA logic
     req_loras = []
     if "loras" in ef:
         for i, l in enumerate(ji.get("loras", [])):
@@ -199,9 +195,9 @@ def generate_images(ji, ef):
         import gc; pipeline = None; lora_adapters_loaded = []; gc.collect(); torch.cuda.empty_cache()
         pipeline, lora_adapters_loaded = initialize_pipeline(ji.get("model_id", DEFAULT_MODEL_ID), req_loras)
 
-    p = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
-    w, h = ji.get("width") or p["width"], ji.get("height") or p["height"]
-    steps, cfg, shift = ji.get("num_inference_steps") or p["num_inference_steps"], ji.get("guidance_scale") or p["guidance_scale"], ji.get("shift") or p["shift"]
+    preset = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
+    w, h = ji.get("width") or preset["width"], ji.get("height") or preset["height"]
+    steps, cfg, shift = ji.get("num_inference_steps") or preset["num_inference_steps"], ji.get("guidance_scale") or preset["guidance_scale"], ji.get("shift") or preset["shift"]
     max_seq_len = ji.get("max_sequence_length", 512)
     
     seed = ji.get("seed", -1)
@@ -236,8 +232,7 @@ def generate_images(ji, ef):
                 t = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
                 with torch.inference_mode(): out = upscaler_model(t).cpu().clamp(0, 1)
                 img = Image.fromarray((out.squeeze(0).permute(1, 2, 0).numpy() * 255).round().astype(np.uint8))
-                tw, th = int(w * ji.get("upscale_factor", 2.0)), int(h * ji.get("upscale_factor", 2.0))
-                img = img.resize((tw, th), Image.LANCZOS)
+                img = img.resize((int(w * ji.get("upscale_factor", 2.0)), int(h * ji.get("upscale_factor", 2.0))), Image.LANCZOS)
         final.append(img)
 
     fmt = ji.get("output_format", "jpeg")
@@ -251,7 +246,7 @@ def generate_images(ji, ef):
             if u: urls.append(u)
             else:
                 b64 = encode_base64(i, fmt)
-                if len(b64) > 1_800_000: return {"error": "S3 Failed and Base64 > 2MB limit."}
+                if len(b64) > 1_800_000: return {"error": "S3 Failed and Base64 > 2MB."}
                 urls.append(b64)
         return {"image_urls": urls, "metadata": meta}
     return {"images": [encode_base64(i, fmt) for i in final], "metadata": meta}
