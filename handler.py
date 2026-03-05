@@ -762,19 +762,14 @@ def _transfer_high_frequency_details(
 
 def _extract_lora_scale(lora: Dict[str, Any], index: int) -> float:
     """Extract LoRA scale from accepted aliases and validate range."""
-    scale_keys = [k for k in ("scale", "strength", "weight", "lora_scale") if k in lora and lora.get(k) is not None]
-    if not scale_keys:
-        raise ValueError(
-            f"`loras[{index}]` must include one scale key: `scale` (preferred), `strength`, `weight`, or `lora_scale`"
-        )
-    if len(scale_keys) > 1:
-        raise ValueError(f"`loras[{index}]` provides multiple scale keys {scale_keys}; use exactly one")
-
-    scale = _coerce_scale_value(lora[scale_keys[0]], f"`loras[{index}].{scale_keys[0]}`")
-    if not (0.0 <= scale <= 2.0):
-        raise ValueError(f"`loras[{index}].{scale_keys[0]}` must be between 0.0 and 2.0")
-
-    return scale
+    # Find the first available scale key.
+    label_keys = [k for k in ("scale", "strength", "weight", "lora_scale") if k in lora]
+    if label_keys:
+        scale = _coerce_scale_value(lora[label_keys[0]], f"`loras[{index}].{label_keys[0]}`")
+        if not (0.0 <= scale <= 2.0):
+            raise ValueError(f"`loras[{index}].{label_keys[0]}` must be between 0.0 and 2.0")
+        return scale
+    raise ValueError(f"`loras[{index}]` must include a scale key: `scale`, `strength`, `weight`, or `lora_scale`")
 
 
 def _coerce_scale_value(value: Any, label: str) -> float:
@@ -1029,8 +1024,7 @@ def _set_active_lora_adapters(
             }
         )
 
-    # Explicitly set adapters on all relevant components to bypass potential
-    # delegation bugs in the pipeline class.
+    # Robust weight injection: target subcomponents individually.
     active_names = [item["adapter_name"] for item in applied]
     active_weights = [item["effective_scale"] for item in applied]
     
@@ -1039,15 +1033,20 @@ def _set_active_lora_adapters(
         comp = getattr(pipeline, name, None)
         if comp is not None and hasattr(comp, "set_adapters"):
             try:
+                # Use high-level API first
                 comp.set_adapters(active_names, adapter_weights=active_weights)
+                
+                # Bypassing potential bugs: manually crawl submodules and force scales.
+                # This ensures weights are active even if delegation fails on quantized layers.
+                for module in comp.modules():
+                    # PEFT LoRA layers typically have these attributes
+                    if hasattr(module, "scaling") and hasattr(module, "adapter_name"):
+                        if module.adapter_name in active_names:
+                            idx = active_names.index(module.adapter_name)
+                            # module.scaling is a dict mapping adapter_name -> scale
+                            module.scaling[module.adapter_name] = active_weights[idx]
             except Exception as e:
-                print(f"Warning: Failed to set LoRA adapters on {name}: {e}")
-
-    # Still call on the pipeline for global consistency
-    try:
-        pipeline.set_adapters(active_names, adapter_weights=active_weights)
-    except Exception:
-        pass
+                print(f"Warning: Failed to robustly set LoRA adapters on {name}: {e}")
 
     return applied
 
@@ -1254,10 +1253,9 @@ def initialize_pipeline(
 
     dtype = DTYPE_MAP.get(DTYPE, torch.bfloat16)
 
-    # Always load from the bf16 base pipeline. fp8 is applied via torchao
+    # Always load from the bf16 base pipeline. fp8 is applied via optimum-quanto
     # quantization below — this avoids the broken from_single_file conversion
-    # path in diffusers (which fails on fp8 scale tensors in the BFL checkpoint
-    # format) and is the officially recommended diffusers approach for fp8 FLUX.
+    # path in diffusers and is the officially recommended approach for fp8.
     pipeline_dtype = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
 
     load_kwargs = {"torch_dtype": pipeline_dtype}
@@ -1269,15 +1267,10 @@ def initialize_pipeline(
     # -------------------------------------------------------------------------
     # 1. Quantize the transformer FIRST.
     # optimum-quanto replaces Linear layers with QuantoLinear. We MUST do this
-    # before loading LoRAs so that the LoRA layers can properly wrap the 
-    # already-quantized base layers.
+    # before loading LoRAs so that the PEFT hooks can properly wrap the 
+    # finalized quantized layers.
     # -------------------------------------------------------------------------
     if dtype == torch.float8_e4m3fn:
-        # Use qint8 instead of qfloat8. The qfloat8 path in optimum-quanto
-        # packs weights into MarlinF8QBytesTensor on CUDA, which requires
-        # contiguous inputs — diffusers does not guarantee this, causing
-        # "RuntimeError: A is not contiguous". qint8 uses a separate code
-        # path with no Marlin dependency and the same ~8-bit storage savings.
         from optimum.quanto import freeze, qint8, quantize
 
         print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
@@ -1288,8 +1281,7 @@ def initialize_pipeline(
     # -------------------------------------------------------------------------
     # 2. Load LoRA weights AFTER quantization but BEFORE CPU offload.
     # diffusers/PEFT require LoRA adapters to be attached before offload
-    # hooks are attached. Now that the model is quantized, PEFT will 
-    # wrap the QuantoLinear layers.
+    # hooks are attached.
     # -------------------------------------------------------------------------
     loaded_lora_adapters: List[Dict[str, str]] = []
     for lora in (lora_adapters or []):
@@ -1320,9 +1312,7 @@ def initialize_pipeline(
     else:
         pipeline = pipeline.to(DEVICE)
 
-    # Set scheduler with shift=2.0 — default for photorealistic character output.
-    # Lower shift = more time at fine-detail timesteps = natural skin/texture.
-    # Overridden per-request in generate_images(); this value only affects warmup.
+    # Set scheduler with shift=1.5
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
         pipeline.scheduler.config,
         shift=1.5,
@@ -1376,48 +1366,19 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
         pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
-    # Handle LoRA stack changes.
-    # LoRAs must be loaded before enable_model_cpu_offload() — PEFT adapter
-    # registration conflicts with accelerate's offload hooks if done after.
-    # Reinitializing the full pipeline is the only safe path on a warm worker.
+    # Handle LoRA stack changes (clean reinit only)
     requested_signature = _lora_stack_signature(requested_lora_adapters)
     loaded_signature = _lora_stack_signature(lora_adapters_loaded)
 
     if requested_signature != loaded_signature:
-        loaded_set = set(loaded_signature)
-        requested_set = set(requested_signature)
-        stale = loaded_set - requested_set  # adapters loaded but no longer wanted
-
-        if stale:
-            # Loaded set has adapters from a previous request that aren't in the new
-            # request. Full reinit required (LoRAs must be loaded before CPU offload).
-            print(
-                f"LoRA stack changed (stale adapters: {len(stale)}, "
-                f"need: {len(requested_lora_adapters)}). Reinitializing pipeline."
-            )
-            import gc
-            pipeline = None
-            lora_adapters_loaded = []
-            gc.collect()
-            torch.cuda.empty_cache()
-            model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
-            pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
-        else:
-            # Loaded set is a subset of requested — some adapters are new or previously
-            # failed to load. Attempt inline loading for missing ones only.
-            missing = [
-                item for item in requested_lora_adapters
-                if (item["path"], item["adapter_name"]) not in loaded_set
-            ]
-            print(f"Loading {len(missing)} additional LoRA adapter(s) inline...")
-            for lora in missing:
-                pipeline, lora_ok = load_lora_weights(
-                    pipeline, lora["path"], adapter_name=lora["adapter_name"]
-                )
-                if lora_ok:
-                    lora_adapters_loaded.append(
-                        {"path": lora["path"], "adapter_name": lora["adapter_name"]}
-                    )
+        print("LoRA stack changed. Reinitializing pipeline for safe loading.")
+        import gc
+        pipeline = None
+        lora_adapters_loaded = []
+        gc.collect()
+        torch.cuda.empty_cache()
+        model_id = job_input.get("model_id", DEFAULT_MODEL_ID)
+        pipeline, lora_adapters_loaded = initialize_pipeline(model_id, requested_lora_adapters)
 
     loaded_keys = {(item["path"], item["adapter_name"]) for item in lora_adapters_loaded}
     active_lora_adapters = [
@@ -1426,80 +1387,50 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
         if (item["path"], item["adapter_name"]) in loaded_keys
     ]
 
-    # Extract parameters - apply preset first, then override with explicit values
+    # Extract parameters
     preset_name = job_input.get("preset", "realistic_character")
-
-    # Start with preset values if specified and valid
     if preset_name and preset_name in PRESETS:
         preset = PRESETS[preset_name].copy()
         width = preset.get("width", 1024)
         height = preset.get("height", 1024)
         num_inference_steps = preset.get("num_inference_steps", 35)
-        guidance_scale = preset.get("guidance_scale", 2.5)
-        shift = preset.get("shift", 2.0)
+        guidance_scale = preset.get("guidance_scale", 2.0)
+        shift = preset.get("shift", 1.5)
     else:
-        width = 1024
-        height = 1024
-        num_inference_steps = 35
-        guidance_scale = 2.0
-        shift = 1.5
+        width, height, num_inference_steps, guidance_scale, shift = 1024, 1024, 35, 2.0, 1.5
 
-    # Override with explicit values if provided
+    # Overrides
     prompt = job_input["prompt"]
-    if "width" in explicit_fields:
-        width = job_input["width"]
-    if "height" in explicit_fields:
-        height = job_input["height"]
-    if "num_inference_steps" in explicit_fields:
-        num_inference_steps = job_input["num_inference_steps"]
-    if "guidance_scale" in explicit_fields:
-        guidance_scale = job_input["guidance_scale"]
-    if "shift" in explicit_fields:
-        shift = job_input["shift"]
+    if "width" in explicit_fields: width = job_input["width"]
+    if "height" in explicit_fields: height = job_input["height"]
+    if "num_inference_steps" in explicit_fields: num_inference_steps = job_input["num_inference_steps"]
+    if "guidance_scale" in explicit_fields: guidance_scale = job_input["guidance_scale"]
+    if "shift" in explicit_fields: shift = job_input["shift"]
 
     seed = job_input.get("seed", -1)
     num_images = job_input.get("num_images", 1)
     output_format = job_input.get("output_format", "png")
     max_sequence_length = job_input.get("max_sequence_length", 512)
 
-    # Set random seed
-    generator = None
+    # RNG
     if seed >= 0:
         generator = torch.Generator(device="cuda").manual_seed(seed)
     else:
         seed = int(time.time() * 1000) % (2**31)
         generator = torch.Generator(device="cuda").manual_seed(seed)
 
-    # shift controls noise schedule bias: lower = more organic detail/skin texture,
-    # higher = stronger large-structure coherence. 2.0 is the photorealism default.
-    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-        pipeline.scheduler.config,
-        shift=shift,
-    )
+    # Scheduler
+    pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config, shift=shift)
 
-    # Apply active LoRA adapter scales before each inference call.
-    applied_main_loras = _set_active_lora_adapters(
-        pipeline,
-        active_lora_adapters,
-        scale_mode=lora_scale_mode,
-        scale_multiplier=1.0,
-    )
+    # Apply LoRAs
+    applied_main_loras = _set_active_lora_adapters(pipeline, active_lora_adapters, scale_mode=lora_scale_mode)
 
-    print(
-        f"Generating image(s): {width}x{height}, steps={num_inference_steps}, "
-        f"guidance={guidance_scale}, shift={shift}, loras={len(applied_main_loras)}"
-    )
+    print(f"Generating image(s): {width}x{height}, steps={num_inference_steps}, guidance={guidance_scale}, shift={shift}")
     if applied_main_loras:
-        print(
-            "Active LoRA weights: "
-            + ", ".join(
-                f"{item['adapter_name']}={item['effective_scale']:.4f}" for item in applied_main_loras
-            )
-        )
+        print("Active LoRA weights: " + ", ".join(f"{item['adapter_name']}={item['effective_scale']:.4f}" for item in applied_main_loras))
 
-    # Generate images
+    # Generate
     start_time = time.time()
-
     with torch.inference_mode():
         result = pipeline(
             prompt=prompt,
@@ -1511,12 +1442,9 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
             num_images_per_prompt=num_images,
             max_sequence_length=max_sequence_length,
         )
-
     generation_time = time.time() - start_time
 
-    # -------------------------------------------------------------------------
-    # Post-processing: 2nd pass detailer and/or tiled upscale
-    # -------------------------------------------------------------------------
+    # Post-processing
     enable_2nd_pass = job_input.get("enable_2nd_pass", False)
     second_pass_strength = job_input.get("second_pass_strength", 0.2)
     second_pass_steps = job_input.get("second_pass_steps", 12)
@@ -1529,134 +1457,34 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
     processed_images = []
     for img in result.images:
         if enable_2nd_pass:
-            img = run_2nd_pass(
-                image=img,
-                prompt=prompt,
-                strength=second_pass_strength,
-                num_steps=second_pass_steps,
-                guidance_scale=second_pass_guidance_scale,
-                shift=shift,
-                generator=generator,
-                lora_adapters=active_lora_adapters,
-                lora_scale_mode=lora_scale_mode,
-                lora_scale_multiplier=second_pass_lora_scale_multiplier,
-            )
+            img = run_2nd_pass(img, prompt, second_pass_strength, second_pass_steps, second_pass_guidance_scale, shift, generator, active_lora_adapters, lora_scale_mode, second_pass_lora_scale_multiplier)
         if enable_upscale:
-            img = tiled_upscale(
-                img,
-                upscale_factor=upscale_factor,
-                upscale_blend=upscale_blend,
-            )
+            img = tiled_upscale(img, upscale_factor, upscale_blend)
         processed_images.append(img)
 
-    active_lora_metadata = [
-        {
-            "path": item["path"],
-            "scale": item["scale"],
-            "adapter_name": item["adapter_name"],
-        }
-        for item in active_lora_adapters
-    ]
-    applied_main_lora_metadata = [
-        {
-            "path": item["path"],
-            "scale": item["scale"],
-            "effective_scale": item["effective_scale"],
-            "adapter_name": item["adapter_name"],
-        }
-        for item in applied_main_loras
-    ]
+    # Metadata & Response
+    active_lora_metadata = [{"path": item["path"], "scale": item["scale"], "adapter_name": item["adapter_name"]} for item in active_lora_adapters]
+    applied_main_lora_metadata = [{"path": item["path"], "scale": item["scale"], "effective_scale": item["effective_scale"], "adapter_name": item["adapter_name"]} for item in applied_main_loras]
     single_lora = active_lora_metadata[0] if len(active_lora_metadata) == 1 else None
-
-    # Process output images
     return_type = job_input.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
 
     if return_type == "s3":
-        # Upload to S3 and return presigned URLs
         image_urls = []
         for img in processed_images:
             url = upload_to_s3(img, output_format)
-            if url:
-                image_urls.append(url)
-            else:
-                # Fallback to base64 if S3 upload fails
-                image_urls.append(encode_image_to_base64(img, output_format))
-
+            image_urls.append(url if url else encode_image_to_base64(img, output_format))
         response = {
-            "image_urls": image_urls,
-            "format": output_format,
-            "return_type": "s3",
-            "parameters": {
-                "prompt": prompt,
-                "width": width,
-                "height": height,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "seed": seed,
-                "num_images": num_images,
-                "shift": shift,
-                "enable_2nd_pass": enable_2nd_pass,
-                "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
-                "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
-                "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
-                "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None,
-                "enable_upscale": enable_upscale,
-                "upscale_factor": upscale_factor if enable_upscale else None,
-                "upscale_blend": upscale_blend if enable_upscale else None,
-            },
-            "metadata": {
-                "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
-                "lora_path": single_lora["path"] if single_lora else None,
-                "lora_scale": single_lora["scale"] if single_lora else None,
-                "loras": active_lora_metadata if active_lora_metadata else None,
-                "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None,
-                "lora_scale_mode": lora_scale_mode if active_lora_metadata else None,
-                "generation_time": f"{generation_time:.2f}s",
-                "preset": preset_name if preset_name else None,
-                "s3_bucket": S3_BUCKET_NAME,
-                "presigned_url_expiry_seconds": S3_PRESIGNED_URL_EXPIRY,
-            },
+            "image_urls": image_urls, "format": output_format, "return_type": "s3",
+            "parameters": {"prompt": prompt, "width": width, "height": height, "num_inference_steps": num_inference_steps, "guidance_scale": guidance_scale, "seed": seed, "num_images": num_images, "shift": shift, "enable_2nd_pass": enable_2nd_pass, "second_pass_strength": second_pass_strength if enable_2nd_pass else None, "second_pass_steps": second_pass_steps if enable_2nd_pass else None, "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None, "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None, "enable_upscale": enable_upscale, "upscale_factor": upscale_factor if enable_upscale else None, "upscale_blend": upscale_blend if enable_upscale else None},
+            "metadata": {"model_id": job_input.get("model_id", DEFAULT_MODEL_ID), "lora_path": single_lora["path"] if single_lora else None, "lora_scale": single_lora["scale"] if single_lora else None, "loras": active_lora_metadata if active_lora_metadata else None, "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None, "lora_scale_mode": lora_scale_mode if active_lora_metadata else None, "generation_time": f"{generation_time:.2f}s", "preset": preset_name if preset_name else None, "s3_bucket": S3_BUCKET_NAME, "presigned_url_expiry_seconds": S3_PRESIGNED_URL_EXPIRY}
         }
     else:
-        # Return base64 encoded images
-        images_base64 = []
-        for img in processed_images:
-            images_base64.append(encode_image_to_base64(img, output_format))
-
+        images_base64 = [encode_image_to_base64(img, output_format) for img in processed_images]
         response = {
-            "images": images_base64,
-            "format": output_format,
-            "return_type": "base64",
-            "parameters": {
-                "prompt": prompt,
-                "width": width,
-                "height": height,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "seed": seed,
-                "num_images": num_images,
-                "shift": shift,
-                "enable_2nd_pass": enable_2nd_pass,
-                "second_pass_strength": second_pass_strength if enable_2nd_pass else None,
-                "second_pass_steps": second_pass_steps if enable_2nd_pass else None,
-                "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None,
-                "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None,
-                "enable_upscale": enable_upscale,
-                "upscale_factor": upscale_factor if enable_upscale else None,
-                "upscale_blend": upscale_blend if enable_upscale else None,
-            },
-            "metadata": {
-                "model_id": job_input.get("model_id", DEFAULT_MODEL_ID),
-                "lora_path": single_lora["path"] if single_lora else None,
-                "lora_scale": single_lora["scale"] if single_lora else None,
-                "loras": active_lora_metadata if active_lora_metadata else None,
-                "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None,
-                "lora_scale_mode": lora_scale_mode if active_lora_metadata else None,
-                "generation_time": f"{generation_time:.2f}s",
-                "preset": preset_name if preset_name else None,
-            },
+            "images": images_base64, "format": output_format, "return_type": "base64",
+            "parameters": {"prompt": prompt, "width": width, "height": height, "num_inference_steps": num_inference_steps, "guidance_scale": guidance_scale, "seed": seed, "num_images": num_images, "shift": shift, "enable_2nd_pass": enable_2nd_pass, "second_pass_strength": second_pass_strength if enable_2nd_pass else None, "second_pass_steps": second_pass_steps if enable_2nd_pass else None, "second_pass_guidance_scale": second_pass_guidance_scale if enable_2nd_pass else None, "second_pass_lora_scale_multiplier": second_pass_lora_scale_multiplier if enable_2nd_pass else None, "enable_upscale": enable_upscale, "upscale_factor": upscale_factor if enable_upscale else None, "upscale_blend": upscale_blend if enable_upscale else None},
+            "metadata": {"model_id": job_input.get("model_id", DEFAULT_MODEL_ID), "lora_path": single_lora["path"] if single_lora else None, "lora_scale": single_lora["scale"] if single_lora else None, "loras": active_lora_metadata if active_lora_metadata else None, "loras_applied": applied_main_lora_metadata if applied_main_lora_metadata else None, "lora_scale_mode": lora_scale_mode if active_lora_metadata else None, "generation_time": f"{generation_time:.2f}s", "preset": preset_name if preset_name else None}
         }
-
     return response
 
 
@@ -1665,42 +1493,19 @@ def generate_images(job_input: Dict[str, Any], explicit_fields: Optional[set[str
 # ============================================================================
 
 def handler(job: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Main RunPod serverless handler function.
-
-    Args:
-        job: RunPod job dictionary with 'input' key containing parameters
-
-    Returns:
-        Dictionary with generated images or error message
-    """
+    """Main RunPod serverless handler function."""
     try:
         raw_job_input = job.get("input", {})
         explicit_fields = set(raw_job_input.keys())
         job_input = _preprocess_job_input(raw_job_input)
-
-        # Validate input
         validation_result = validate(job_input, INPUT_SCHEMA)
         if "errors" in validation_result:
-            return {
-                "error": "Validation failed",
-                "details": validation_result["errors"]
-            }
-
+            return {"error": "Validation failed", "details": validation_result["errors"]}
         validated_input = validation_result["validated_input"]
-
-        # Generate images
-        result = generate_images(validated_input, explicit_fields=explicit_fields)
-
-        return result
-
+        return generate_images(validated_input, explicit_fields=explicit_fields)
     except Exception as e:
         import traceback
-        return {
-            "error": str(e),
-            "error_type": type(e).__name__,
-            "traceback": traceback.format_exc()
-        }
+        return {"error": str(e), "error_type": type(e).__name__, "traceback": traceback.format_exc()}
 
 
 # ============================================================================
@@ -1708,14 +1513,5 @@ def handler(job: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================================
 
 if __name__ == "__main__":
-    print("Starting FLUX.2-klein RunPod Serverless Worker...")
-    print(f"Model ID: {DEFAULT_MODEL_ID}")
-    print(f"Default LoRA Path: {DEFAULT_LORA_PATH if DEFAULT_LORA_PATH else 'None'}")
-    print(f"Device: {DEVICE}")
-    print(f"Dtype: {DTYPE}")
-    print(f"Flash Attention: {USE_FLASH_ATTN} (note: not supported by Flux2KleinPipeline attn kwarg)")
-    print(f"S3 Bucket: {S3_BUCKET_NAME if S3_BUCKET_NAME else 'Not configured'}")
-    print(f"HF Token: {'Configured' if HF_TOKEN else 'Not configured (required for gated models)'}")
-
-    # Start the serverless worker
+    print(f"Starting FLUX.2-klein RunPod Serverless Worker... Model ID: {DEFAULT_MODEL_ID}")
     runpod.serverless.start({"handler": handler})
