@@ -1250,31 +1250,13 @@ def initialize_pipeline(
 
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, **load_kwargs)
 
-    # fp8 transformer quantization via optimum-quanto.
-    # Reduces transformer VRAM from ~18 GB (bf16) to ~9 GB (fp8), bringing the
-    # full pipeline to ~14-16 GB — fits RTX 4090 (24 GB) without any offload.
-    # Text encoders remain at bf16 for quality; only the transformer is quantized.
-    # Weights are quantized on CPU before pipeline.to(DEVICE) so the GPU move is
-    # already at reduced size — no OOM during loading.
-    if dtype == torch.float8_e4m3fn:
-        # Use qint8 instead of qfloat8. The qfloat8 path in optimum-quanto
-        # packs weights into MarlinF8QBytesTensor on CUDA, which requires
-        # contiguous inputs — diffusers does not guarantee this, causing
-        # "RuntimeError: A is not contiguous". qint8 uses a separate code
-        # path with no Marlin dependency and the same ~8-bit storage savings.
-        from optimum.quanto import freeze, qint8, quantize
-
-        print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
-        quantize(pipeline.transformer, weights=qint8)
-        freeze(pipeline.transformer)
-        print("int8 quantization complete")
-
-    # Load LoRA weights BEFORE enabling CPU offload or moving to device.
+    # -------------------------------------------------------------------------
+    # 1. Load LoRA weights BEFORE quantization and BEFORE CPU offload.
     # diffusers/PEFT require LoRA adapters to be attached while the model is
-    # in its base (pre-hook) state. Calling load_lora_weights after
-    # enable_model_cpu_offload() causes accelerate's offload hooks to
-    # interfere with PEFT adapter registration, silently failing on the
-    # second and subsequent adapters.
+    # in its base (unquantized, pre-hook) state. Attaching LoRAs to already-
+    # quantized layers or after offload hooks are attached causes silent 
+    # failure where the adapter is registered but has zero impact.
+    # -------------------------------------------------------------------------
     loaded_lora_adapters: List[Dict[str, str]] = []
     for lora in (lora_adapters or []):
         pipeline, lora_ok = load_lora_weights(
@@ -1297,6 +1279,19 @@ def initialize_pipeline(
         if (item["path"], item["adapter_name"]) in loaded_keys
     ]
     _set_active_lora_adapters(pipeline, active_loras)
+
+    # -------------------------------------------------------------------------
+    # 2. Quantize the transformer.
+    # optimum-quanto replaces Linear layers with QuantoLinear. Since we 
+    # attached LoRAs above, the LoRA layers will now wrap the quantized base.
+    # -------------------------------------------------------------------------
+    if dtype == torch.float8_e4m3fn:
+        from optimum.quanto import freeze, qint8, quantize
+
+        print("Quantizing transformer to int8 via optimum-quanto (target VRAM ~14-16 GB)")
+        quantize(pipeline.transformer, weights=qint8)
+        freeze(pipeline.transformer)
+        print("int8 quantization complete")
 
     if ENABLE_CPU_OFFLOAD:
         print("Using model CPU offload")
