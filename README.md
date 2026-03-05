@@ -20,7 +20,7 @@ This serverless API generates high-quality images using the **FLUX.2-klein-base-
 - **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
 - **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture, plus character LoRA-optimized presets
 - **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
-- **2nd Pass Detailer** - Optional low-denoise img2img pass (same pipeline, zero extra VRAM) for skin pore and micro-contrast refinement
+- **2nd Pass Detailer** - Optional non-destructive detail-injection pass (zero extra VRAM) that adds sharpness and micro-texture while 100% preserving the base image's style, colors, and composition.
 - **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap (16.7% ratio for seam-free output)
 - **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
 - **LoRA Stack Switching** - When the requested LoRA set changes between requests, the pipeline reinitializes to safely load new adapters before CPU offload hooks are attached
