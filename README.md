@@ -1,59 +1,75 @@
-# FLUX.2-klein-base-9B RunPod Serverless
+# FLUX.2-klein-9B RunPod Serverless
 
 [![RunPod](https://img.shields.io/badge/RunPod-Serverless-blue)](https://runpod.io)
 [![Python](https://img.shields.io/badge/Python-3.12-green)](https://python.org)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8.0-orange)](https://pytorch.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
-> A production-ready RunPod serverless deployment for FLUX.2-klein-base-9B image generation with custom LoRA weight support, tuned for photorealistic human portraits.
+> A production-ready RunPod serverless deployment for **FLUX.2-klein-9B** (distilled) image generation with custom LoRA weight support, tuned for photorealistic human portraits.
 
-This serverless API generates high-quality images using the **FLUX.2-klein-base-9B** base model via `Flux2KleinPipeline`, with support for custom LoRA weights loaded from HTTPS URLs, HuggingFace Hub, or local paths. Output is delivered via S3 presigned URLs or base64.
+This serverless API generates high-quality images using the **FLUX.2-klein-9B distilled** model via `Flux2KleinPipeline`, loaded as separate FP8 components (transformer + abliterated Qwen3-8B text encoder + VAE) to minimize VRAM. Output is delivered via S3 presigned URLs or base64.
 
-> **Important:** This uses the **base (undistilled)** model. Use 35–50 inference steps and guidance scale 2.0–3.0. Do **not** use 4–8 steps or guidance 1.0 — those settings are for the distilled variant. Do **not** use guidance 4.0+ — it produces over-rendered, plastic-looking skin.
+> **Model:** This uses the **distilled** (step + guidance distilled) variant. Optimal settings are **4–16 steps, guidance 1.0**. The distilled model produces excellent results in as few as 4 steps; 8–12 steps gives a good quality/speed balance.
 
 ## ✨ Features
 
-- **FLUX.2-klein-base-9B** - Undistilled 9B-parameter flow-match transformer by Black Forest Labs
-- **Flux2KleinPipeline** - Correct pipeline class via git diffusers (not available in stable releases)
-- **Custom LoRA Support** - Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
-- **Multi-LoRA Mixing** - Load multiple LoRA adapters simultaneously with independent per-adapter weights
-- **Tunable Scheduler Shift** - `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
-- **Photorealism-Tuned Presets** - Low guidance + low shift defaults for natural skin texture, plus character LoRA-optimized presets
-- **INT8 Quantization** - Transformer quantized via optimum-quanto for ~9 GB VRAM footprint
-- **2nd Pass Detailer** - Optional non-destructive detail-injection pass (zero extra VRAM) that adds sharpness and micro-texture while 100% preserving the base image's style, colors, and composition.
-- **Tiled 4× Upscaler** - Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap (16.7% ratio for seam-free output)
-- **Flexible Generation** - Configurable resolution, steps, guidance scale, shift, and batch size
-- **LoRA Stack Switching** - When the requested LoRA set changes between requests, the pipeline reinitializes to safely load new adapters before CPU offload hooks are attached
-- **Multiple Output Formats** - PNG, JPEG, WebP support
-- **S3 Storage** - Upload images to S3 with presigned URLs (no base64 size limits)
-- **RunPod Model Cache** - HuggingFace cache on network volumes for fast restarts; upscaler model auto-downloaded and cached on first use
-- **High-Performance Downloads** - Xet storage backend with concurrent chunk downloads
+- **FLUX.2-klein-9B Distilled** — Step + guidance distilled 9B-parameter flow-match transformer by Black Forest Labs
+- **FP8 Component Loading** — Transformer (FP8) + Qwen3-8B text encoder (FP8, abliterated) + VAE loaded separately; fits in ~24 GB VRAM with `enable_model_cpu_offload()`
+- **Abliterated Text Encoder** — `edicamargo/qwen_3_8b_fp8mixed_abliterated` weights with `Qwen/Qwen3-8B-FP8` config; removes refusal restrictions for creative generation
+- **Flux2KleinPipeline** — Correct pipeline class via git diffusers (not available in stable releases)
+- **Custom LoRA Support** — Load LoRA weights from HTTPS URLs, HuggingFace Hub, or local `.safetensors`
+- **Multi-LoRA Mixing** — Load multiple LoRA adapters simultaneously with independent per-adapter weights
+- **Tunable Scheduler Shift** — `FlowMatchEulerDiscreteScheduler` with configurable shift (default 1.5)
+- **2nd Pass Detailer** — Optional non-destructive detail-injection pass that adds sharpness and micro-texture while preserving base image style, colors, and composition
+- **Tiled 4× Upscaler** — Optional DRCT-L super-resolution via [4xRealWebPhoto_v4_drct-l](https://github.com/Phhofm/models) with feather-blended 384px tiles and 64px overlap
+- **Flexible Generation** — Configurable resolution, steps, guidance scale, shift, and batch size
+- **LoRA Stack Switching** — When the requested LoRA set changes between requests, the pipeline reinitializes to safely load new adapters before CPU offload hooks are attached
+- **Multiple Output Formats** — PNG, JPEG, WebP support
+- **S3 Storage** — Upload images to S3 with presigned URLs (no base64 size limits)
+- **RunPod Model Cache** — HuggingFace cache on network volumes for fast restarts; upscaler model auto-downloaded and cached on first use
+- **High-Performance Downloads** — `hf_transfer` backend + Xet storage with concurrent chunk downloads
 
 ## 🏗️ Architecture
 
-The system uses `Flux2KleinPipeline` (git diffusers) with `FlowMatchEulerDiscreteScheduler`. The pipeline is loaded once per worker into full VRAM and reused across requests. The transformer is quantized to INT8 via optimum-quanto on CPU before GPU placement, reducing VRAM from ~18 GB to ~9 GB. LoRA adapters are loaded **before** `enable_model_cpu_offload()` is called — this is required because PEFT adapter registration conflicts with accelerate's offload hooks if done after. When the requested LoRA stack changes between requests, the full pipeline reinitializes to preserve this ordering. Requests can use either a single legacy LoRA (`lora_path` + `lora_scale`) or a multi-LoRA stack (`loras` list).
+### Component Loading
 
-**FLUX.2-klein latent format:** The VAE uses **32 latent channels** (vs 16 in FLUX.1). The pipeline's internal latent representation is `(B, 128, H/16, W/16)` — a space-to-depth folding of the VAE output where 2×2 spatial blocks are folded into the channel dimension (`pixel_unshuffle(r=2)`), then flat-reshaped to a token sequence `(B, seq, 128)` for the transformer.
+Components are loaded individually (ComfyUI-style) to minimize peak VRAM:
 
-### Data Flow Pipeline
+| Component | Source | dtype | VRAM |
+|-----------|--------|-------|------|
+| Transformer | `black-forest-labs/FLUX.2-klein-9b-fp8` → `flux-2-klein-9b-fp8.safetensors` | `float8_e4m3fn` | ~4.5 GB |
+| Text Encoder | `edicamargo/qwen_3_8b_fp8mixed_abliterated` weights + `Qwen/Qwen3-8B-FP8` config | `float8_e4m3fn` | ~8 GB |
+| VAE | `black-forest-labs/FLUX.2-klein-9B`, subfolder `vae` | `bfloat16` | ~0.7 GB |
+| Tokenizer | `Qwen/Qwen3-8B-FP8` | — | — |
+| Scheduler | `black-forest-labs/FLUX.2-klein-9B`, subfolder `scheduler` | — | — |
+
+The text encoder (abliterated) has no `config.json` in its repo — it is initialized on meta device using the official `Qwen/Qwen3-8B-FP8` config, then the abliterated state dict is loaded in-place via `load_state_dict(..., assign=True)`. Architecture is identical to the official model; only the refusal vectors are removed.
+
+The transformer and text encoder are downloaded as single safetensors files to `/runpod-volume/models/flux2-klein/`. The VAE, tokenizer, and scheduler are fetched via `from_pretrained` and cached under `HF_HOME` (`/runpod-volume/huggingface`).
+
+### Data Flow
 
 1. **Input Validation** — Parameters validated against schema, preset defaults applied
-2. **Pipeline Init** — `Flux2KleinPipeline.from_pretrained()` + INT8 quantization; **LoRA adapters loaded here** (before CPU offload/device placement); `enable_model_cpu_offload()` or `.to("cuda")`; scheduler initialized with `shift=1.5`; VAE slicing/tiling enabled
-3. **LoRA Stack Check** — If requested adapter stack differs from what is loaded, pipeline reinitializes (same sequence as step 2) to safely load the new adapters before offload hooks are attached
+2. **Pipeline Init** — Components loaded individually; **LoRA adapters loaded here** (before CPU offload hooks); `enable_model_cpu_offload()` called; VAE slicing/tiling enabled
+3. **LoRA Stack Check** — If requested adapter stack differs from loaded, pipeline reinitializes
 4. **Scheduler Update** — `FlowMatchEulerDiscreteScheduler.from_config(config, shift=N)` applied per request
 5. **Image Generation** — Flow-match inference via `Flux2KleinPipeline`
-6. **2nd Pass Detailer** *(optional)* — Calls `Flux2KleinPipeline` again with the 1st pass image as the `image` conditioning input at low steps and low guidance. High-frequency detail from the refined result is blended back onto the 1st pass output via `_transfer_high_frequency_details()`, preserving identity and composition while adding skin pore and micro-contrast texture. LoRA stays active for subject consistency.
-7. **Tiled Upscale** *(optional)* — DRCT-L 4× SR via spandrel with 512px/32px feather-blended tiles; result resized to `upscale_factor` via LANCZOS; model auto-downloaded to `/runpod-volume/models/` on first use
+6. **2nd Pass Detailer** *(optional)* — Pipeline called again with 1st pass image as `image` conditioning at low steps; high-frequency detail blended back onto 1st pass result
+7. **Tiled Upscale** *(optional)* — DRCT-L 4× SR via spandrel with 384px/64px feather-blended tiles; result resized to `upscale_factor`
 8. **Output** — Images uploaded to S3 (presigned URL) or encoded to base64
+
+### LoRA Loading Order (Critical)
+
+LoRA adapters **must** be loaded before `enable_model_cpu_offload()`. PEFT adapter registration conflicts with accelerate's offload hooks if done after. When the LoRA stack changes between requests, the full pipeline reinitializes to preserve this ordering.
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Docker** - For containerized deployment
-- **RunPod Account** - For serverless GPU deployment
-- **NVIDIA GPU** - H100 or A100 80GB recommended; RTX 4090 (24 GB) works with INT8 quantization
-- **HuggingFace Token** - Required (FLUX.2-klein-base-9B is a gated model)
+- **Docker** — For containerized deployment
+- **RunPod Account** — For serverless GPU deployment
+- **NVIDIA GPU** — RTX 4090 (24 GB) or better; H100 / A100 80GB recommended
+- **HuggingFace Token** — Required for `black-forest-labs/FLUX.2-klein-9b-fp8` (gated) and `black-forest-labs/FLUX.2-klein-9B` VAE/scheduler (gated)
 
 ### Installation
 
@@ -79,62 +95,58 @@ curl -X POST http://localhost:8000/runpod/v1/lgpu/input \
 
 ### Deploy to RunPod (GitHub Integration)
 
-The easiest deployment method uses RunPod's GitHub integration for automatic builds on every push.
-
 1. **Push code to GitHub:**
 ```bash
-git init
-git add .
-git commit -m "Initial FLUX.2-klein serverless implementation"
+git init && git add . && git commit -m "Initial commit"
 git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPO.git
 git push -u origin main
 ```
 
 2. **Create Serverless Template** at [console.runpod.io/serverless/user/templates](https://console.runpod.io/serverless/user/templates):
-   - Select **GitHub** as source
-   - Choose your repository
-   - Configure: **Container Disk**: 30 GB, **Min/Max Workers**: 0-10, **GPU**: NVIDIA H100
-   - **Network Volume**: Recommended for model caching (30GB+)
+   - Source: **GitHub**
+   - **Container Disk**: 30 GB
+   - **Min/Max Workers**: 0–10
+   - **GPU**: NVIDIA H100 or RTX 4090
+   - **Network Volume**: Recommended (30 GB+) for model caching
 
 3. **Set Environment Variables** (see Configuration section below)
 
-4. **Deploy** — RunPod automatically builds and deploys. Future pushes trigger redeployment.
+4. **Deploy** — RunPod builds and deploys automatically. Future pushes trigger redeployment.
 
 ## 📖 Documentation
 
 ### Optimized Presets
 
-All presets are tuned for photorealistic human character output. Lower guidance and shift produce natural skin texture; higher values produce more stylised or structured results.
+All presets are tuned for the **distilled** FLUX.2-klein-9B model (4–16 steps, guidance 1.0).
 
 #### General Purpose Presets
 
 | Preset | Steps | Guidance | Shift | Resolution | Best For |
 |--------|-------|----------|-------|------------|----------|
-| `realistic_character` | 35 | 2.0 | 1.5 | 1024×1024 | **Photorealistic human LoRAs** (default) |
-| `portrait_hd` | 40 | 2.0 | 1.5 | 1024×1536 | High-detail vertical portraits |
-| `cinematic_full` | 35 | 2.5 | 1.5 | 1536×1024 | Full-body cinematic compositions |
-| `fast_preview` | 20 | 2.0 | 1.5 | 1024×1024 | Quick prompt/seed testing |
-| `maximum_quality` | 50 | 2.5 | 1.0 | 1024×1024 | Highest quality final output |
+| `realistic_character` | 8 | 1.0 | 1.5 | 1024×1024 | **Photorealistic human LoRAs** (default) |
+| `portrait_hd` | 8 | 1.0 | 1.5 | 1024×1536 | High-detail vertical portraits |
+| `cinematic_full` | 8 | 1.0 | 1.5 | 1536×1024 | Full-body cinematic compositions |
+| `fast_preview` | 4 | 1.0 | 1.5 | 1024×1024 | Quick prompt/seed testing |
+| `maximum_quality` | 16 | 1.0 | 1.0 | 1024×1024 | Highest quality final output |
 
 #### Character LoRA Optimized Presets
 
-These presets are specifically tuned for character LoRAs using BFL-recommended settings:
-
 | Preset | Steps | Guidance | Shift | Resolution | Best For |
 |--------|-------|----------|-------|------------|----------|
-| `character_portrait_best` | 45 | 2.2 | 2.5 | 1024×1024 | **Best quality for character portraits** — natural skin, maximum fidelity |
-| `character_portrait_vertical` | 45 | 2.0 | 2.0 | 896×1152 | Head/shoulders portraits — 4:5 ratio ideal for faces |
-| `character_cinematic` | 40 | 2.5 | 2.5 | 1344×896 | Full-body or environmental shots — cinematic 3:2 horizontal |
+| `character_portrait_best` | 12 | 1.0 | 2.5 | 1024×1024 | **Best quality for character portraits** — natural skin, maximum fidelity |
+| `character_portrait_vertical` | 12 | 1.0 | 2.0 | 896×1152 | Head/shoulders portraits — 4:5 ratio ideal for faces |
+| `character_cinematic` | 8 | 1.0 | 2.5 | 1344×896 | Full-body or environmental shots — cinematic 3:2 horizontal |
+| `manga_style` | 8 | 1.0 | 1.5 | 1024×1024 | Stylized / manga / illustration output |
 
-### Realistic Character Best Practices
+### Distilled Model Best Practices
 
-> **This is the base (undistilled) model.** Do not use distilled model settings.
+> **This is the distilled (step + guidance distilled) model.** Do not use BASE model settings (35–50 steps, guidance 2.0+).
 
 **Optimal Inference Settings:**
-- **Steps:** 35–50 (sweet spot: 35–40 for quality/speed balance)
-- **Guidance:** 2.0–2.5 — lower = more organic, natural-looking skin; higher = more stylised
-- **Scheduler Shift:** 1.0–1.5 for photorealism; lower = more denoising budget on fine-detail timesteps (pores, texture, natural imperfection)
-- **Resolution:** 1024×1024 standard, 1024×1536 for portraits (match your training preview size)
+- **Steps:** 4–16 (sweet spot: 8–12 for quality/speed balance; 4 for real-time previewing)
+- **Guidance:** 1.0 — the model is guidance-distilled; this is the optimal value. Values above ~2.0 cause over-saturation and artifacts
+- **Scheduler Shift:** 1.0–1.5 for photorealism; 2.0–2.5 for strong character identity with LoRAs
+- **Resolution:** 1024×1024 standard, 1024×1536 for portraits
 - **LoRA Scale:** 0.7–0.9 — start at 0.85; avoid 1.0+ (pushes identity too hard, reduces naturalness)
 
 **Trigger Word:** Include your LoRA trigger word first in the prompt (AI-Toolkit convention).
@@ -153,8 +165,8 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 
 **Prompting Notes:**
 - FLUX.2-klein uses Qwen3-8B as text encoder — it handles long, descriptive prompts well
-- Avoid SDXL boilerplate ("masterpiece, best quality", "photorealistic, highly detailed skin texture") — these keywords are associated with over-processed, retouched aesthetics
-- Use camera/film language instead: "ISO 800", "slight film grain", "unretouched", "candid" — these anchor the model to real photography priors
+- Avoid SDXL boilerplate ("masterpiece, best quality", "photorealistic, highly detailed skin texture") — these are associated with over-processed aesthetics
+- Use camera/film language instead: "ISO 800", "slight film grain", "unretouched", "candid"
 - FLUX.2-klein does **not** support `negative_prompt` — it is ignored
 
 ### Scheduler Shift Reference
@@ -162,7 +174,7 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | Shift | Effect |
 |-------|--------|
 | `1.0` | Maximum fine-detail budget; most natural skin/texture; best for close-up portraits |
-| `1.5` | **Default for photorealistic character LoRAs**; natural texture with good structure |
+| `1.5` | **Default**; natural texture with good structure |
 | `2.0` | Balanced; slightly stronger large-structure coherence |
 | `2.5` | BFL recommendation for character LoRAs; excellent identity preservation |
 | `3.0` | Better face/structure coherence; may smooth skin texture |
@@ -189,13 +201,11 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
       }
     ],
     "lora_scale_mode": "normalized",
-    "guidance_scale": 2.2,
-    "shift": 2.5,
     "seed": 42,
     "return_type": "s3",
     "enable_2nd_pass": true,
     "second_pass_strength": 0.2,
-    "second_pass_steps": 12,
+    "second_pass_steps": 4,
     "second_pass_guidance_scale": 1.0,
     "second_pass_lora_scale_multiplier": 0.7,
     "enable_upscale": true,
@@ -216,43 +226,24 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 }
 ```
 
-**Response Format (S3 - default if configured):**
+**Response Format (S3):**
 ```json
 {
   "image_urls": ["https://s3.amazonaws.com/bucket/flux2-klein/uuid.jpg?X-Amz-Algorithm=..."],
-  "format": "jpeg",
-  "return_type": "s3",
-  "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
-    "lora_path": null,
-    "lora_scale": null,
-    "loras": [
-      { "path": "https://example.com/your-character-lora.safetensors", "scale": 0.85, "adapter_name": "character" },
-      { "path": "https://example.com/your-style-lora.safetensors", "scale": 0.45, "adapter_name": "style" }
-    ],
-    "generation_time": "12.34s",
-    "preset": "portrait_hd",
-    "s3_bucket": "your-bucket-name",
-    "presigned_url_expiry_seconds": 3600
+    "loras": [{"adapter_name": "character", "effective_scale": 0.85}],
+    "generation_time": "3.21s"
   }
 }
 ```
 
-**Response Format (Base64 - fallback):**
+**Response Format (Base64 fallback):**
 ```json
 {
   "images": ["<base64_encoded_image>"],
-  "format": "jpeg",
-  "return_type": "base64",
-  "parameters": { "width": 1024, "height": 1536, "num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "seed": 42 },
   "metadata": {
-    "model_id": "black-forest-labs/FLUX.2-klein-base-9B",
-    "lora_path": null,
-    "lora_scale": null,
-    "loras": null,
-    "generation_time": "12.34s",
-    "preset": "portrait_hd"
+    "loras": [],
+    "generation_time": "3.21s"
   }
 }
 ```
@@ -265,43 +256,39 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `preset` | string | `realistic_character` | Quality preset (see table above) |
 | `width` | int | `1024` | Image width (multiple of 16) |
 | `height` | int | `1024` | Image height (multiple of 16) |
-| `num_inference_steps` | int | `35` | Denoising steps — 35–50 for base model; 50 for maximum quality |
-| `guidance_scale` | float | `2.0` | CFG scale — 2.0–2.5 for photorealism; higher = more stylised/plastic |
-| `shift` | float | `1.5` | Scheduler shift — 1.0–1.5 for natural skin texture; higher for structure |
+| `num_inference_steps` | int | `8` | Denoising steps — 4 for speed, 8–12 for quality, 16 for maximum |
+| `guidance_scale` | float | `1.0` | CFG scale — keep at 1.0 for distilled model; values above ~2.0 cause artifacts |
+| `shift` | float | `1.5` | Scheduler shift — 1.0–1.5 for natural skin; 2.0–2.5 for character identity |
 | `seed` | int | `-1` | Random seed (-1 for random) |
-| `num_images` | int | `1` | Number of images per request (1–4) |
+| `num_images` | int | `1` | Number of images per request |
 | `output_format` | string | `"jpeg"` | Output format: `png`, `jpeg`, `webp` |
 | `return_type` | string | `"s3"` | Response type: `s3` (presigned URL) or `base64` |
-| `loras` | list | `[]` | Optional multi-LoRA input. Each item: `{ "path": string, "scale": float, "adapter_name": string? }`; `path` aliases `url`, `lora_url`, `lora_path` are accepted; scale aliases `strength`, `weight`, `lora_scale` are accepted; `adapter_name` defaults to `flux_lora_<index>` (or `trigger_word` if provided) |
-| `additional_lora` | string | `""` | Frontend-compatibility alias for a second LoRA path when not using `loras`; aliases: `additional_lora_path`, `additional_lora_url`, `addition_lora`, `addition_lora_url` |
-| `additional_lora_strength` | float | `0.85` | Frontend-compatibility alias for second LoRA strength (0.0–2.0); `additional_lora_scale` is also accepted |
-| `lora_scale_mode` | string | `"absolute"` | Multi-LoRA scale interpretation: `absolute` (raw scales passed through) or `normalized` (scales are normalized to sum to 1.0 after multiplier) |
-| `lora_path` | string | `""` | Legacy single-LoRA path (used when `loras` is not provided); alias: `lora_url` |
-| `lora_scale` | float | `0.85` | Legacy single-LoRA scale (0.0–2.0; used with `lora_path`) |
-| `max_sequence_length` | int | `512` | Maximum token length for text encoding (up to 512) |
+| `max_sequence_length` | int | `512` | Maximum token length for text encoding |
+| `loras` | list | `[]` | Multi-LoRA stack. Each item: `{ "path": string, "scale": float, "adapter_name": string? }`. Path aliases: `url`, `lora_url`, `lora_path`. Scale aliases: `strength`, `weight`, `lora_scale` |
+| `lora_scale_mode` | string | `"absolute"` | `absolute` (raw scales) or `normalized` (scales normalized to sum 1.0) |
+| `lora_path` | string | `""` | Legacy single-LoRA path; alias: `lora_url` |
+| `lora_scale` | float | `0.85` | Legacy single-LoRA scale |
+| `additional_lora` | string | `""` | Second LoRA path (legacy); aliases: `additional_lora_path`, `additional_lora_url`, `addition_lora`, `addition_lora_url` |
+| `additional_lora_strength` | float | `0.85` | Second LoRA scale (legacy); alias: `additional_lora_scale` |
 | **2nd Pass Detailer** | | | |
-| `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass after generation |
-| `second_pass_strength` | float | `0.2` | Detailer denoise strength (0.0–1.0); 0.2 adds skin/pore detail without composition drift |
-| `second_pass_steps` | int | `12` | Inference steps for the 2nd pass (5–50) |
-| `second_pass_guidance_scale` | float | `1.0` | CFG for 2nd pass — keep low (1.0–1.3) to avoid over-saturation |
-| `second_pass_lora_scale_multiplier` | float | `1.0` | Multiplier for LoRA scales in 2nd pass (0.0–2.0); use `<1.0` if LoRA effects feel too strong after detail pass |
+| `enable_2nd_pass` | bool | `false` | Enable low-denoise img2img detailer pass |
+| `second_pass_strength` | float | `0.2` | Denoise strength — 0.2 adds skin/pore detail without composition drift |
+| `second_pass_steps` | int | `4` | Steps for 2nd pass |
+| `second_pass_guidance_scale` | float | `1.0` | CFG for 2nd pass — keep at 1.0 |
+| `second_pass_lora_scale_multiplier` | float | `1.0` | Multiplier for LoRA scales in 2nd pass |
 | **Upscaler** | | | |
-| `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution upscaling |
-| `upscale_factor` | float | `2.0` | Target upscale multiplier (0.25–4.0); model runs at 4×, result resized to this factor |
-| `upscale_blend` | float | `0.35` | Blend of AI upscale over LANCZOS (0.0–1.0); lower = more faithful to original; 0.35 preserves color/composition |
+| `enable_upscale` | bool | `false` | Enable DRCT-L 4× tiled super-resolution |
+| `upscale_factor` | float | `2.0` | Target upscale multiplier; model runs at 4×, result resized to this factor |
+| `upscale_blend` | float | `0.35` | Blend of AI upscale over LANCZOS (0.0–1.0); 0.35 preserves color/composition |
 
 ### Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-base-9B` | Base model (loaded via `Flux2KleinPipeline`) |
-| `DEFAULT_LORA_PATH` | `""` | Default LoRA loaded at worker startup |
-| `DEFAULT_LORA_SCALE` | `1.0` | Default LoRA weight scale |
+| `HF_TOKEN` | `""` | **Required** — gated access to `black-forest-labs/FLUX.2-klein-9b-fp8` and `black-forest-labs/FLUX.2-klein-9B` |
+| `MODEL_ID` | `black-forest-labs/FLUX.2-klein-9B` | VAE/scheduler source repo |
 | `DEVICE` | `cuda` | Compute device |
-| `DTYPE` | `float8_e4m3fn` | Compute dtype — triggers INT8 quantization of transformer via optimum-quanto |
-| `ENABLE_CPU_OFFLOAD` | `false` | Use CPU offload instead of full VRAM placement |
-| `HF_TOKEN` | `""` | **Required** — FLUX.2-klein-base-9B is a gated model |
-| `UPSCALER_MODEL_PATH` | `/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth` | Path to DRCT-L upscaler model; auto-downloaded from GitHub on first use |
+| `UPSCALER_MODEL_PATH` | `/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth` | DRCT-L upscaler path; auto-downloaded on first use |
 
 ### S3 Configuration (Optional)
 
@@ -314,32 +301,30 @@ natural skin, visible pores, unretouched, ISO 800, slight film grain
 | `S3_ENDPOINT_URL` | `""` | Custom S3 endpoint (e.g., MinIO, Wasabi) |
 | `S3_PRESIGNED_URL_EXPIRY` | `3600` | Presigned URL expiry in seconds |
 
-**Note:** When `S3_BUCKET_NAME` is configured, images are uploaded to S3 and a presigned URL is returned instead of base64. This avoids payload size limits and improves response times.
+When `S3_BUCKET_NAME` is set, images are uploaded to S3 and a presigned URL is returned instead of base64, avoiding payload size limits.
 
 ### HuggingFace Performance Tuning
 
-| Environment Variable | Default | Description |
-|---------------------|---------|-------------|
-| `HF_HOME` | `/runpod-volume/huggingface` | HuggingFace cache directory |
+| Environment Variable | Value | Description |
+|---------------------|-------|-------------|
+| `HF_HOME` | `/runpod-volume/huggingface` | HuggingFace cache directory (network volume) |
 | `HF_HUB_CACHE` | `/runpod-volume/huggingface/hub` | Model cache directory |
+| `HF_HUB_ENABLE_HF_TRANSFER` | `1` | Enable `hf_transfer` for fast parallel downloads |
 | `HF_XET_HIGH_PERFORMANCE` | `1` | Enable high-performance Xet downloads |
-| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` | Concurrent download chunks |
+| `HF_XET_NUM_CONCURRENT_RANGE_GETS` | `32` | Concurrent download chunks (default: 16) |
 | `HF_HUB_ETAG_TIMEOUT` | `30` | Timeout for metadata requests (seconds) |
 | `HF_HUB_DOWNLOAD_TIMEOUT` | `300` | Timeout for file downloads (seconds) |
 
 ### VRAM Requirements
 
-| Configuration | VRAM | Notes |
-|---------------|------|-------|
-| BF16, no offload | ~22–24 GB | Best quality; H100/A100 80GB |
-| INT8 quantized (default) | ~14–16 GB | Good quality; RTX 4090 (24 GB), A100 40 GB |
-| INT8 + 2nd pass | ~14–16 GB | Same pipeline reused — zero additional VRAM |
-| INT8 + upscaler | ~14–16 GB + ~300 MB | DRCT-L loaded alongside; tiled inference keeps per-tile VRAM trivial |
-| BF16 + CPU offload | ~12–14 GB | Slower; set `ENABLE_CPU_OFFLOAD=true` |
+| Configuration | Peak VRAM | Notes |
+|---------------|-----------|-------|
+| FP8 components + cpu offload | ~14–16 GB | **Default** — components swapped CPU↔GPU per forward pass |
+| FP8 components, no offload | ~14 GB loaded simultaneously | Faster; requires 16 GB+ free VRAM |
+| FP8 + 2nd pass | ~14–16 GB | Same pipeline reused — zero additional VRAM |
+| FP8 + upscaler | ~14–16 GB + ~300 MB | DRCT-L tiled; per-tile VRAM negligible |
 
-The default `DTYPE=float8_e4m3fn` triggers INT8 quantization of the transformer via optimum-quanto, reducing transformer VRAM from ~18 GB to ~9 GB while keeping text encoders and VAE at BF16.
-
-The 2nd pass detailer reuses the already-loaded `Flux2KleinPipeline` with the `image` conditioning parameter — no second model is loaded, so VRAM usage is identical to a standard generation request. The DRCT-L upscaler (~300 MB) is loaded separately via spandrel and cached globally after first use; 384px tiles with 64px overlap (16.7% blend ratio) eliminate seam artifacts while keeping per-tile VRAM negligible.
+Component breakdown: transformer FP8 ~4.5 GB + Qwen3-8B FP8 ~8 GB + VAE bf16 ~0.7 GB = ~13.2 GB loaded. With `enable_model_cpu_offload()` peak is lower as only the active component is on GPU at any time.
 
 ## 🎨 Training Custom LoRAs
 
@@ -359,35 +344,25 @@ python flux_train_ui.py
 - **Weight Decay:** 0.00001
 - **Dataset:** 20–40 images with diverse angles, expressions, and lighting
 
-**Training → Inference Alignment:** Match `num_inference_steps` and `lora_scale` to your AI-Toolkit training YAML's `sample.sample_steps` and `sample.lora_weight`. For `guidance_scale`, start at 2.0 regardless of training YAML value — the training guidance is for the distilled sampler and does not translate directly.
+**Training → Inference Alignment:** Train against the base model (`FLUX.2-klein-base-9B`) for maximum LoRA flexibility. Inference on the distilled model with the trained LoRA works well at 8–12 steps, guidance 1.0, shift 2.5.
 
 ## 📝 Prompt Engineering Guide
 
-See [SYSTEMPROMPT.md](SYSTEMPROMPT.md) for a comprehensive system prompt template that converts messy user input into optimized FLUX.2-klein prompts. This is useful for:
-
-- Building a prompt enhancement layer in your application
-- Converting simple user descriptions into professional prompts
-- Learning FLUX-optimized prompting techniques
-
-The guide includes:
-- Prompt structure framework (Subject + Action + Style + Context)
-- Camera/lens references for photorealism
-- Keywords to avoid (anti-AI-artifact list)
-- Character/portrait best practices
-- Implementation code examples
+See [SYSTEMPROMPT.md](SYSTEMPROMPT.md) for a comprehensive system prompt template that converts user input into optimized FLUX.2-klein prompts. Includes prompt structure framework, camera/lens references, anti-artifact keyword list, and implementation examples.
 
 ## 📄 License
 
-This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-base-9B model has its own license terms — refer to the [HuggingFace model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B).
+This code is provided as-is for RunPod serverless deployments. The FLUX.2-klein-9B model is licensed under the [FLUX Non-Commercial License](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B/blob/main/LICENSE.md). The 4B models are Apache 2.0.
 
 ## 🙏 Acknowledgments
 
-- **[ai-toolkit](https://github.com/ostris/ai-toolkit)** by ostris - Training framework and reference implementation
-- **[FLUX.2-klein-base-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)** by Black Forest Labs - Base model
-- **[RunPod](https://runpod.io)** - Serverless GPU infrastructure
+- **[ai-toolkit](https://github.com/ostris/ai-toolkit)** by ostris — LoRA training framework
+- **[FLUX.2-klein-9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B)** by Black Forest Labs — distilled model
+- **[Qwen3-8B](https://huggingface.co/Qwen/Qwen3-8B-FP8)** by Alibaba — text encoder
+- **[RunPod](https://runpod.io)** — Serverless GPU infrastructure
 
 ## 📧 Support
 
 - **This deployment:** Check logs in RunPod console
-- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B)
+- **Model behavior:** Consult [FLUX.2-klein model card](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B)
 - **Training:** See [ai-toolkit issues](https://github.com/ostris/ai-toolkit/issues)
