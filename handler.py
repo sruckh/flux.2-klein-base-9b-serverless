@@ -1,12 +1,11 @@
-"""
-RunPod Serverless Handler for FLUX.2-klein-base-9B with LoRA Support
-Based on ai-toolkit by ostris
-"""
+# Set VRAM fragmentation protection before ANY imports
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["QUANTO_DISABLE_MARLIN"] = "1"
 
 import base64
 import io
 import json
-import os
 import tempfile
 import time
 import urllib.request
@@ -24,11 +23,7 @@ from PIL import Image, ImageFilter
 import runpod
 from runpod.serverless.utils.rp_validator import validate
 
-# Environment Config
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# Marlin kernels for FP8 are currently buggy in this environment (contiguity errors)
-os.environ["QUANTO_DISABLE_MARLIN"] = "1"
-
+# Configuration
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "")
@@ -39,6 +34,8 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "black-forest-labs/FLUX.2-klein-base-9B")
 DEVICE = os.getenv("DEVICE", "cuda")
 ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "false").lower() == "true"
+UPSCALER_MODEL_URL = "https://github.com/Phhofm/models/releases/download/4xRealWebPhoto_v4_drct-l/4xRealWebPhoto_v4_drct-l.pth"
+UPSCALER_MODEL_PATH = "/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth"
 
 # Globals
 pipeline = None
@@ -48,7 +45,12 @@ upscaler_model = None
 PRESETS = {
     "realistic_character": {"num_inference_steps": 35, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1024},
     "portrait_hd": {"num_inference_steps": 40, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1536},
+    "cinematic_full": {"num_inference_steps": 35, "guidance_scale": 2.5, "shift": 1.5, "width": 1536, "height": 1024},
+    "fast_preview": {"num_inference_steps": 20, "guidance_scale": 2.0, "shift": 1.5, "width": 1024, "height": 1024},
+    "maximum_quality": {"num_inference_steps": 50, "guidance_scale": 2.5, "shift": 1.0, "width": 1024, "height": 1024},
     "character_portrait_best": {"num_inference_steps": 45, "guidance_scale": 2.2, "shift": 2.5, "width": 1024, "height": 1024},
+    "character_portrait_vertical": {"num_inference_steps": 45, "guidance_scale": 2.0, "shift": 2.0, "width": 896, "height": 1152},
+    "character_cinematic": {"num_inference_steps": 40, "guidance_scale": 2.5, "shift": 2.5, "width": 1344, "height": 896},
     "manga_style": {"num_inference_steps": 25, "guidance_scale": 1.0, "shift": 1.5, "width": 1024, "height": 1024},
 }
 
@@ -61,12 +63,12 @@ INPUT_SCHEMA = {
     "guidance_scale": {"type": float, "required": False, "default": 2.0},
     "seed": {"type": int, "required": False, "default": -1},
     "num_images": {"type": int, "required": False, "default": 1},
-    "loras": {"type": list, "required": False, "default": []},
-    "lora_scale_mode": {"type": str, "required": False, "default": "absolute"},
     "output_format": {"type": str, "required": False, "default": "jpeg"},
     "return_type": {"type": str, "required": False, "default": "s3"},
     "shift": {"type": float, "required": False, "default": 1.5},
     "max_sequence_length": {"type": int, "required": False, "default": 512},
+    "loras": {"type": list, "required": False, "default": []},
+    "lora_scale_mode": {"type": str, "required": False, "default": "absolute"},
     "enable_2nd_pass": {"type": bool, "required": False, "default": False},
     "second_pass_strength": {"type": float, "required": False, "default": 0.2},
     "second_pass_steps": {"type": int, "required": False, "default": 12},
@@ -83,21 +85,27 @@ INPUT_SCHEMA = {
     "additional_lora_url": {"type": str, "required": False, "default": ""},
     "additional_lora_scale": {"type": float, "required": False, "default": 0.85},
     "additional_lora_strength": {"type": float, "required": False, "default": 0.85},
+    "addition_lora": {"type": str, "required": False, "default": ""},
+    "addition_lora_url": {"type": str, "required": False, "default": ""},
+    "addition_lora_scale": {"type": float, "required": False, "default": 0.85},
+    "addition_lora_strength": {"type": float, "required": False, "default": 0.85},
 }
 
-def _preprocess_job_input(ji: Dict[str, Any]) -> Dict[str, Any]:
+def _preprocess_job_input(ji):
     if not isinstance(ji, dict): return ji
     ji = dict(ji)
-    fkeys = ["lora_scale", "additional_lora_strength", "additional_lora_scale", "second_pass_lora_scale_multiplier"]
+    fkeys = ["lora_scale", "additional_lora_scale", "additional_lora_strength", 
+              "addition_lora_scale", "addition_lora_strength", "second_pass_lora_scale_multiplier",
+              "second_pass_strength", "upscale_factor", "upscale_blend", "guidance_scale", "shift"]
     for k in fkeys:
-        if k in ji and isinstance(ji[k], (str, float, int)):
+        if k in ji and isinstance(ji[k], (str, int, float)):
             try: ji[k] = float(str(ji[k]).strip())
             except: pass
     if isinstance(ji.get("loras"), list):
         for item in ji["loras"]:
             if isinstance(item, dict):
                 for sk in ("scale", "strength", "weight", "lora_scale"):
-                    if sk in item and isinstance(item[sk], (str, float, int)):
+                    if sk in item and isinstance(item[sk], (str, int, float)):
                         try: item[sk] = float(str(item[sk]).strip())
                         except: pass
     return ji
@@ -147,17 +155,16 @@ def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
 def initialize_pipeline(model_id, adapters=None):
     vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     use_quant = vram < 40.0
-    print(f"Loading {model_id} (VRAM: {vram:.1f}GB, Quantized: {use_quant})")
+    print(f"Loading {model_id} (VRAM: {vram:.1f}GB, Quant: {use_quant})")
     pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16, token=HF_TOKEN or None)
 
     if use_quant:
         try:
             from optimum.quanto import freeze, quantize, qint8
-            print("Quantizing transformer to int8 (Stable Path)...")
+            print("Quantizing transformer to int8...")
             quantize(pipe.transformer, weights=qint8)
             freeze(pipe.transformer)
-        except Exception as e:
-            print(f"Quantization failed, falling back to BF16: {e}")
+        except Exception as e: print(f"Quantization failed: {e}")
 
     loaded = []
     for l in (adapters or []):
@@ -179,6 +186,7 @@ def initialize_pipeline(model_id, adapters=None):
 
 def generate_images(ji, ef):
     global pipeline, lora_adapters_loaded
+    # Normalize LoRAs
     req_loras = []
     if "loras" in ef:
         for i, l in enumerate(ji.get("loras", [])):
@@ -188,11 +196,20 @@ def generate_images(ji, ef):
         lp = (ji.get("lora_path") or ji.get("lora_url") or "").strip()
         if lp: req_loras.append({"path": lp, "scale": float(ji.get("lora_scale", 0.85)), "adapter_name": "l_0"})
         alp = (ji.get("additional_lora") or ji.get("additional_lora_path") or ji.get("additional_lora_url") or "").strip()
-        if alp: req_loras.append({"path": alp, "scale": float(ji.get("additional_lora_scale") or ji.get("additional_lora_strength") or 0.85), "adapter_name": "l_1"})
+        if alp:
+            ascl = ji.get("additional_lora_scale") or ji.get("additional_lora_strength") or 0.85
+            req_loras.append({"path": alp, "scale": float(ascl), "adapter_name": "l_1"})
 
+    # OOM PROTECTION: Aggressive cache clearing on reload
     sig = lambda x: tuple((y["path"], y["adapter_name"]) for y in x)
     if pipeline is None or sig(req_loras) != sig(lora_adapters_loaded):
-        import gc; pipeline = None; lora_adapters_loaded = []; gc.collect(); torch.cuda.empty_cache()
+        print("LoRA stack change. Resetting VRAM...")
+        pipeline = None
+        import gc
+        for _ in range(3):
+            gc.collect()
+            torch.cuda.empty_cache()
+        time.sleep(1)
         pipeline, lora_adapters_loaded = initialize_pipeline(ji.get("model_id", DEFAULT_MODEL_ID), req_loras)
 
     preset = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
@@ -207,7 +224,7 @@ def generate_images(ji, ef):
     applied = _set_loras(pipeline, lora_adapters_loaded, mode=ji.get("lora_scale_mode", "absolute"))
     
     print(f"Inference: {w}x{h}, {steps} steps, CFG {cfg}")
-    start = time.time()
+    start_time = time.time()
     with torch.inference_mode():
         res = pipeline(prompt=ji["prompt"], width=w, height=h, num_inference_steps=steps, guidance_scale=cfg, generator=torch.Generator(DEVICE).manual_seed(seed), num_images_per_prompt=ji.get("num_images", 1), max_sequence_length=max_seq_len)
     
@@ -217,8 +234,7 @@ def generate_images(ji, ef):
             _set_loras(pipeline, lora_adapters_loaded, multiplier=ji.get("second_pass_lora_scale_multiplier", 1.0))
             with torch.inference_mode():
                 refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 12), guidance_scale=ji.get("second_pass_guidance_scale", 1.0)).images[0]
-            b_np = np.asarray(img.convert("RGB"), dtype=np.float32)
-            r_rgb = refined.convert("RGB")
+            b_np, r_rgb = np.asarray(img.convert("RGB"), dtype=np.float32), refined.convert("RGB")
             r_low = np.asarray(r_rgb.filter(ImageFilter.GaussianBlur(1.25)), dtype=np.float32)
             diff = (np.asarray(r_rgb, dtype=np.float32) - r_low) * ji.get("second_pass_strength", 0.2)
             img = Image.fromarray(np.clip(b_np + diff, 0, 255).astype(np.uint8))
@@ -237,7 +253,7 @@ def generate_images(ji, ef):
 
     fmt = ji.get("output_format", "jpeg")
     rt = ji.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
-    meta = {"loras": applied, "seed": seed, "time": f"{time.time()-start:.2f}s"}
+    meta = {"loras": applied, "seed": seed, "generation_time": f"{time.time()-start_time:.2f}s"}
     
     if rt == "s3":
         urls = []
@@ -260,7 +276,9 @@ def handler(job):
         return generate_images(val["validated_input"], set(raw.keys()))
     except Exception as e:
         import traceback
-        return {"error": f"{type(e).__name__}: {str(e)}", "traceback": traceback.format_exc()}
+        tb = traceback.format_exc()
+        print(f"CRITICAL ERROR: {e}\n{tb}")
+        return {"error": f"{type(e).__name__}: {str(e)}", "traceback": tb}
 
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
