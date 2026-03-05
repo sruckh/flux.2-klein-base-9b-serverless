@@ -8,8 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
     DEBIAN_FRONTEND=noninteractive \
-    HF_HOME=/runpod-volume/huggingface \
-    HF_HUB_CACHE=/runpod-volume/huggingface/hub \
+    HF_HOME=/runpod-volume/huggingface-cache \
+    HF_HUB_CACHE=/runpod-volume/huggingface-cache/hub \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     HF_XET_HIGH_PERFORMANCE=1 \
     HF_XET_NUM_CONCURRENT_RANGE_GETS=32 \
@@ -62,10 +62,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create directories for models, LoRA weights, and HuggingFace cache
-RUN mkdir -p /workspace/models /workspace/lora /runpod-volume/huggingface
-
-# Set proper permissions for cache directory
-RUN chmod -R 777 /runpod-volume
+RUN mkdir -p /workspace/models /workspace/lora /runpod-volume/huggingface-cache
 
 # Set the handler as the entrypoint
 CMD ["python3", "handler.py"]
