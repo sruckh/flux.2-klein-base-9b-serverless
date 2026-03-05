@@ -40,10 +40,12 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "black-forest-labs/FLUX.2-klein-9B")
 DEVICE = os.getenv("DEVICE", "cuda")
 
-# Transformer + abliterated text encoder downloaded as single safetensors files.
-# VAE, scheduler, and tokenizer loaded via from_pretrained (uses HF_HOME cache).
+# Abliterated text encoder downloaded as a single safetensors file.
+# Transformer, VAE, scheduler, and tokenizer loaded via from_pretrained (uses HF_HOME cache).
+# NOTE: The FLUX.2-klein-9b-fp8 single-file uses BFL's custom static-quantized format
+# (separate input_scale/weight_scale tensors per layer) which is incompatible with
+# FluxTransformer2DModel.load_state_dict — load bf16 transformer from the main repo instead.
 MODEL_URLS = {
-    "transformer": "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8/resolve/main/flux-2-klein-9b-fp8.safetensors",
     "text_encoder": "https://huggingface.co/edicamargo/qwen_3_8b_fp8mixed_abliterated/resolve/main/qwen_3_8b_fp8mixed_abliterated.safetensors",
 }
 
@@ -205,19 +207,16 @@ def initialize_pipeline(adapters=None):
         token=HF_TOKEN or None,
     )
 
-    # Transformer: FP8 distilled single-file checkpoint (already in diffusers key format).
-    # from_single_file fails because its converter expects original BFL keys (time_in.*)
-    # which don't exist in this checkpoint → KeyError: 'time_in.in_layer.bias'.
-    # Fix: bootstrap config from the base repo, init on meta device, then load weights directly.
-    transformer_config = FluxTransformer2DModel.load_config(
+    # Transformer: load in bfloat16 from the official distilled repo.
+    # The FLUX.2-klein-9b-fp8 single-file uses BFL's custom static-quantized FP8 format
+    # (separate input_scale/weight_scale tensors) that is incompatible with
+    # FluxTransformer2DModel — the diffusers-format weights live in the main repo.
+    transformer = FluxTransformer2DModel.from_pretrained(
         "black-forest-labs/FLUX.2-klein-9B",
         subfolder="transformer",
+        torch_dtype=torch.bfloat16,
         token=HF_TOKEN or None,
     )
-    with torch.device("meta"):
-        transformer = FluxTransformer2DModel.from_config(transformer_config)
-    tr_sd = load_safetensors(paths["transformer"])
-    transformer.load_state_dict(tr_sd, strict=True, assign=True)
 
     # Text encoder: abliterated Qwen3-8B weights, config bootstrapped from official repo.
     # edicamargo repo has weights only (no config.json), so we init from Qwen/Qwen3-8B-FP8
