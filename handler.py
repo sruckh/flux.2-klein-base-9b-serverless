@@ -310,7 +310,7 @@ def generate_images(ji, ef):
 
     print(f"Inference: {w}x{h}, {steps} steps, CFG {cfg}")
     start_time = time.time()
-    with torch.inference_mode():
+    with torch.no_grad():
         res = pipeline(
             prompt=ji["prompt"], width=w, height=h,
             num_inference_steps=steps, guidance_scale=cfg,
@@ -323,7 +323,7 @@ def generate_images(ji, ef):
     for img in res.images:
         if ji.get("enable_2nd_pass"):
             _set_loras(pipeline, lora_adapters_loaded, multiplier=ji.get("second_pass_lora_scale_multiplier", 1.0))
-            with torch.inference_mode():
+            with torch.no_grad():
                 refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 4), guidance_scale=ji.get("second_pass_guidance_scale", 1.0)).images[0]
             b_np, r_rgb = np.asarray(img.convert("RGB"), dtype=np.float32), refined.convert("RGB")
             r_low = np.asarray(r_rgb.filter(ImageFilter.GaussianBlur(1.25)), dtype=np.float32)
