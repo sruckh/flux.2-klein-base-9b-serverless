@@ -16,7 +16,7 @@ import numpy as np
 import boto3
 import torch
 from botocore.exceptions import ClientError
-from diffusers import FluxTransformer2DModel, Flux2KleinPipeline, AutoencoderKL
+from diffusers import Flux2KleinPipeline, AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from safetensors.torch import load_file as load_safetensors
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
@@ -199,51 +199,28 @@ def initialize_pipeline(adapters=None):
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"Loading Components (VRAM: {vram_gb:.1f}GB)...")
 
-    # VAE: official config + weights from distilled repo (requires HF_TOKEN)
-    vae = AutoencoderKL.from_pretrained(
+    # Load the full pipeline so diffusers resolves the correct transformer class
+    # for FLUX.2-klein-9B's non-standard architecture (to_qkv_mlp_proj fused attn,
+    # double_stream_modulation_img.linear, etc.) that FluxTransformer2DModel doesn't match.
+    print("Loading Flux2KleinPipeline from pretrained...")
+    pipe = Flux2KleinPipeline.from_pretrained(
         "black-forest-labs/FLUX.2-klein-9B",
-        subfolder="vae",
         torch_dtype=torch.bfloat16,
         token=HF_TOKEN or None,
     )
 
-    # Transformer: load in bfloat16 from the official distilled repo.
-    # The FLUX.2-klein-9b-fp8 single-file uses BFL's custom static-quantized FP8 format
-    # (separate input_scale/weight_scale tensors) that is incompatible with
-    # FluxTransformer2DModel — the diffusers-format weights live in the main repo.
-    transformer = FluxTransformer2DModel.from_pretrained(
-        "black-forest-labs/FLUX.2-klein-9B",
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16,
-        token=HF_TOKEN or None,
-    )
-
-    # Text encoder: abliterated Qwen3-8B weights, config bootstrapped from official repo.
-    # edicamargo repo has weights only (no config.json), so we init from Qwen/Qwen3-8B-FP8
-    # config on meta device, then load the abliterated state dict in-place.
+    # Swap text encoder: replace the official Qwen3-8B with abliterated weights.
+    # edicamargo repo has weights only (no config.json) — bootstrap config from
+    # Qwen/Qwen3-8B-FP8 on meta device, then assign the abliterated state dict.
+    # Note: float8_e4m3fn cannot be used as a torch default dtype (set_default_dtype
+    # fails), so we init in default dtype and let assign=True set tensor dtypes from file.
+    print("Loading abliterated text encoder...")
     te_config = AutoConfig.from_pretrained("Qwen/Qwen3-8B-FP8")
     with torch.device("meta"):
-        text_encoder = AutoModelForCausalLM.from_config(te_config, torch_dtype=torch.float8_e4m3fn)
+        text_encoder = AutoModelForCausalLM.from_config(te_config)
     te_sd = load_safetensors(paths["text_encoder"])
     text_encoder.load_state_dict(te_sd, strict=True, assign=True)
-
-    # Tokenizer: Qwen3-8B vocabulary (identical to abliterated variant)
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B-FP8")
-
-    # Scheduler: from distilled repo
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        "black-forest-labs/FLUX.2-klein-9B",
-        subfolder="scheduler",
-        token=HF_TOKEN or None,
-    )
-
-    pipe = Flux2KleinPipeline(
-        vae=vae,
-        transformer=transformer,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        scheduler=scheduler,
-    )
+    pipe.text_encoder = text_encoder
 
     if adapters:
         for l in adapters:
