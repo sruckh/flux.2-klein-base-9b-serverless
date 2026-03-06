@@ -43,6 +43,13 @@ For each request:
 7. Optional tiled upscale.
 8. Return S3 URLs or base64.
 
+Second-pass detail mode guardrails:
+
+- `second_pass_steps` is clamped to `1..4`.
+- `second_pass_guidance_scale` is forced to `1.0`.
+- `second_pass_lora_scale_multiplier` is clamped to `0.0..1.0`.
+- Only luminance high-frequency detail is blended back into the base image (color/composition remain from pass 1).
+
 ## Input Parameters
 
 ### Required
@@ -89,9 +96,9 @@ LoRA scaling mode:
 
 - `enable_2nd_pass` (`bool`, default `false`)
 - `second_pass_strength` (`float`, default `0.2`)
-- `second_pass_steps` (`int`, default `4`)
-- `second_pass_guidance_scale` (`float`, default `1.0`)
-- `second_pass_lora_scale_multiplier` (`float`, default `1.0`)
+- `second_pass_steps` (`int`, default `4`, runtime clamp `1..4`)
+- `second_pass_guidance_scale` (`float`, default `1.0`, runtime forced to `1.0`)
+- `second_pass_lora_scale_multiplier` (`float`, default `1.0`, runtime clamp `0.0..1.0`)
 
 ### Upscale
 
@@ -118,6 +125,7 @@ Current presets in code:
 - This worker targets the distilled FLUX.2-klein-9B path.
 - Guidance values above `1.0` are clamped to `1.0` before pipeline calls (first pass and second pass).
 - Response metadata includes `requested_guidance_scale` and `effective_guidance_scale`.
+- Second pass is constrained to detail enhancement only (not stylistic re-rendering).
 
 ## Environment Variables
 

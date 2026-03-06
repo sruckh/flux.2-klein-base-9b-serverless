@@ -236,6 +236,30 @@ def initialize_pipeline(adapters=None):
     pipe.vae.enable_tiling()
     return pipe, loaded_adapters
 
+def _detail_only_blend(base_img, refined_img, strength):
+    # Keep color/composition from base image and inject only luminance micro-detail.
+    strength = float(np.clip(strength, 0.0, 0.35))
+    base_ycc = np.asarray(base_img.convert("YCbCr"), dtype=np.float32)
+    refined_y = np.asarray(refined_img.convert("YCbCr"), dtype=np.float32)[..., 0]
+    base_y = base_ycc[..., 0]
+
+    refined_low = np.asarray(
+        Image.fromarray(refined_y.astype(np.uint8), mode="L").filter(ImageFilter.GaussianBlur(1.5)),
+        dtype=np.float32,
+    )
+    detail = refined_y - refined_low
+
+    base_low = np.asarray(
+        Image.fromarray(base_y.astype(np.uint8), mode="L").filter(ImageFilter.GaussianBlur(1.2)),
+        dtype=np.float32,
+    )
+    edge = np.abs(base_y - base_low)
+    edge = edge / (edge.max() + 1e-6)
+    edge = np.clip((edge - 0.05) / 0.95, 0.0, 1.0)
+
+    base_ycc[..., 0] = np.clip(base_y + detail * edge * strength, 0.0, 255.0)
+    return Image.fromarray(base_ycc.astype(np.uint8), mode="YCbCr").convert("RGB")
+
 def tiled_upscale(image, factor, blend):
     from spandrel import ModelLoader
     global upscaler_model
@@ -314,11 +338,14 @@ def generate_images(ji, ef):
 
     print(f"Inference: {w}x{h}, {steps} steps, CFG {cfg}")
     start_time = time.time()
+    seed = ji.get("seed", -1)
+    if seed < 0:
+        seed = int(time.time())
     with torch.no_grad():
         res = pipeline(
             prompt=ji["prompt"], width=w, height=h,
             num_inference_steps=steps, guidance_scale=cfg,
-            generator=torch.Generator(DEVICE).manual_seed(ji.get("seed", -1) if ji.get("seed", -1) >= 0 else int(time.time())),
+            generator=torch.Generator(DEVICE).manual_seed(seed),
             num_images_per_prompt=ji.get("num_images", 1),
             max_sequence_length=max_seq_len,
         )
@@ -326,17 +353,36 @@ def generate_images(ji, ef):
     final = []
     for img in res.images:
         if ji.get("enable_2nd_pass"):
-            _set_loras(pipeline, lora_adapters_loaded, multiplier=ji.get("second_pass_lora_scale_multiplier", 1.0))
-            second_pass_cfg = ji.get("second_pass_guidance_scale", 1.0)
-            if getattr(getattr(pipeline, "config", None), "is_distilled", False) and second_pass_cfg > 1.0:
-                print(f"Distilled model active; overriding second_pass_guidance_scale {second_pass_cfg} -> 1.0")
-                second_pass_cfg = 1.0
+            second_pass_multiplier = float(ji.get("second_pass_lora_scale_multiplier", 1.0))
+            if second_pass_multiplier > 1.0:
+                print(f"Detail-only second pass: clamping second_pass_lora_scale_multiplier {second_pass_multiplier} -> 1.0")
+                second_pass_multiplier = 1.0
+            if second_pass_multiplier < 0.0:
+                print(f"Detail-only second pass: clamping second_pass_lora_scale_multiplier {second_pass_multiplier} -> 0.0")
+                second_pass_multiplier = 0.0
+            _set_loras(pipeline, lora_adapters_loaded, multiplier=second_pass_multiplier)
+
+            requested_second_pass_steps = int(ji.get("second_pass_steps", 4))
+            second_pass_steps = max(1, min(requested_second_pass_steps, 4))
+            if second_pass_steps != requested_second_pass_steps:
+                print(f"Detail-only second pass: clamping second_pass_steps {requested_second_pass_steps} -> {second_pass_steps}")
+
+            requested_second_pass_cfg = float(ji.get("second_pass_guidance_scale", 1.0))
+            second_pass_cfg = 1.0
+            if requested_second_pass_cfg != 1.0:
+                print(f"Detail-only second pass: overriding second_pass_guidance_scale {requested_second_pass_cfg} -> 1.0")
+
             with torch.no_grad():
-                refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 4), guidance_scale=second_pass_cfg).images[0]
-            b_np, r_rgb = np.asarray(img.convert("RGB"), dtype=np.float32), refined.convert("RGB")
-            r_low = np.asarray(r_rgb.filter(ImageFilter.GaussianBlur(1.25)), dtype=np.float32)
-            diff = (np.asarray(r_rgb, dtype=np.float32) - r_low) * ji.get("second_pass_strength", 0.2)
-            img = Image.fromarray(np.clip(b_np + diff, 0, 255).astype(np.uint8))
+                refined = pipeline(
+                    prompt=ji["prompt"],
+                    image=img,
+                    width=img.width,
+                    height=img.height,
+                    num_inference_steps=second_pass_steps,
+                    guidance_scale=second_pass_cfg,
+                    generator=torch.Generator(DEVICE).manual_seed(seed),
+                ).images[0]
+            img = _detail_only_blend(img.convert("RGB"), refined.convert("RGB"), ji.get("second_pass_strength", 0.2))
         if ji.get("enable_upscale"):
             img = tiled_upscale(img, ji.get("upscale_factor", 2.0), ji.get("upscale_blend", 0.35))
         final.append(img)
