@@ -79,18 +79,23 @@ Multi-LoRA (preferred):
     - `path` (or aliases: `url`, `lora_url`, `lora_path`)
     - `scale` (or aliases: `strength`, `weight`, `lora_scale`)
     - `adapter_name` (optional; auto-generated if omitted)
+    - `weight_name` (optional; useful when loading from HF repo paths)
 
 Legacy single/dual aliases are also supported:
 
 - `lora_path`, `lora_url`, `lora_scale`
+- `lora_weight_name`
 - `additional_lora`, `additional_lora_path`, `additional_lora_url`
 - `addition_lora`, `addition_lora_url`
 - `additional_lora_scale`, `additional_lora_strength`
 - `addition_lora_scale`, `addition_lora_strength`
+- `additional_lora_weight_name`, `addition_lora_weight_name`
 
 LoRA scaling mode:
 
 - `lora_scale_mode`: `absolute` (default) or `normalized`
+- `loras` and legacy fields can be combined in one request.
+- Adapter names must be unique across all requested LoRAs.
 
 ### Second Pass
 
@@ -163,6 +168,7 @@ LoRA load failures are fatal for the request:
 
 - Worker raises a runtime error that includes adapter name and source path.
 - This avoids silent generation with missing adapters.
+- Worker validates that each requested adapter is actually registered on the Flux2 `transformer` before inference.
 
 ## Deployment
 

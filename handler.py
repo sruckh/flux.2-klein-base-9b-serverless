@@ -100,15 +100,18 @@ INPUT_SCHEMA = {
     "lora_path": {"type": str, "required": False, "default": ""},
     "lora_url": {"type": str, "required": False, "default": ""},
     "lora_scale": {"type": float, "required": False, "default": 0.85},
+    "lora_weight_name": {"type": str, "required": False, "default": ""},
     "additional_lora": {"type": str, "required": False, "default": ""},
     "additional_lora_path": {"type": str, "required": False, "default": ""},
     "additional_lora_url": {"type": str, "required": False, "default": ""},
     "additional_lora_scale": {"type": float, "required": False, "default": 0.85},
     "additional_lora_strength": {"type": float, "required": False, "default": 0.85},
+    "additional_lora_weight_name": {"type": str, "required": False, "default": ""},
     "addition_lora": {"type": str, "required": False, "default": ""},
     "addition_lora_url": {"type": str, "required": False, "default": ""},
     "addition_lora_scale": {"type": float, "required": False, "default": 0.85},
     "addition_lora_strength": {"type": float, "required": False, "default": 0.85},
+    "addition_lora_weight_name": {"type": str, "required": False, "default": ""},
 }
 
 # ============================================================================
@@ -173,6 +176,54 @@ def encode_base64(image, fmt):
     image.save(buf, format="JPEG", quality=80, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
+def _collect_requested_loras(ji):
+    adapters = []
+
+    for i, l in enumerate(ji.get("loras", []) or []):
+        if not isinstance(l, dict):
+            continue
+        p = l.get("path") or l.get("url") or l.get("lora_url") or l.get("lora_path")
+        if not p:
+            continue
+        adapters.append({
+            "path": p,
+            "scale": float(l.get("scale") or l.get("strength") or l.get("weight") or l.get("lora_scale") or 0.85),
+            "adapter_name": l.get("adapter_name", f"l_{i}"),
+            "weight_name": l.get("weight_name"),
+        })
+
+    # Legacy fallbacks are still supported and can be combined with `loras`.
+    lp = (ji.get("lora_path") or ji.get("lora_url") or "").strip()
+    if lp:
+        adapters.append({
+            "path": lp,
+            "scale": float(ji.get("lora_scale", 0.85)),
+            "adapter_name": "legacy_l_0",
+            "weight_name": ji.get("lora_weight_name"),
+        })
+
+    alp = (ji.get("additional_lora") or ji.get("additional_lora_path") or ji.get("additional_lora_url") or ji.get("addition_lora") or ji.get("addition_lora_url") or "").strip()
+    if alp:
+        ascl = ji.get("additional_lora_scale") or ji.get("additional_lora_strength") or ji.get("addition_lora_scale") or ji.get("addition_lora_strength") or 0.85
+        adapters.append({
+            "path": alp,
+            "scale": float(ascl),
+            "adapter_name": "legacy_l_1",
+            "weight_name": ji.get("additional_lora_weight_name") or ji.get("addition_lora_weight_name"),
+        })
+
+    # Ensure deterministic/valid adapter names to avoid accidental replacement.
+    seen = set()
+    for a in adapters:
+        name = str(a.get("adapter_name") or "").strip()
+        if not name:
+            raise ValueError(f"Invalid empty adapter_name for path: {a.get('path')}")
+        if name in seen:
+            raise ValueError(f"Duplicate adapter_name '{name}'. Adapter names must be unique for multi-LoRA.")
+        seen.add(name)
+
+    return adapters
+
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if not adapters: return []
     scales = [float(a["scale"]) * multiplier for a in adapters]
@@ -223,12 +274,25 @@ def initialize_pipeline(adapters=None):
                         urllib.request.urlretrieve(l['path'], p)
                         pipe.load_lora_weights(tmp, weight_name="lora.safetensors", adapter_name=l['adapter_name'])
                 else:
-                    pipe.load_lora_weights(l['path'], adapter_name=l['adapter_name'])
+                    load_kwargs = {"adapter_name": l["adapter_name"]}
+                    if l.get("weight_name"):
+                        load_kwargs["weight_name"] = l["weight_name"]
+                    pipe.load_lora_weights(l['path'], **load_kwargs)
                 loaded_adapters.append(l)
             except Exception as e:
                 raise RuntimeError(
                     f"Failed to load LoRA adapter '{l['adapter_name']}' from '{l['path']}': {e}"
                 ) from e
+
+    if loaded_adapters and hasattr(pipe, "get_list_adapters"):
+        list_adapters = pipe.get_list_adapters()
+        transformer_adapters = set(list_adapters.get("transformer", []))
+        missing = [a["adapter_name"] for a in loaded_adapters if a["adapter_name"] not in transformer_adapters]
+        if missing:
+            raise RuntimeError(
+                f"LoRA adapter(s) loaded but not registered on transformer: {missing}. "
+                "Check LoRA format compatibility (Flux2 transformer LoRA expected)."
+            )
 
     _set_loras(pipe, loaded_adapters)
     pipe.enable_model_cpu_offload()
@@ -299,20 +363,9 @@ def tiled_upscale(image, factor, blend):
         res_img = Image.blend(base, res_img, alpha=blend)
     return res_img
 
-def generate_images(ji, ef):
+def generate_images(ji):
     global pipeline, lora_adapters_loaded
-    req_loras = []
-    if "loras" in ef:
-        for i, l in enumerate(ji.get("loras", [])):
-            p = l.get("path") or l.get("url") or l.get("lora_url") or l.get("lora_path")
-            if p: req_loras.append({"path": p, "scale": float(l.get("scale") or l.get("strength") or l.get("weight") or 0.85), "adapter_name": l.get("adapter_name", f"l_{i}")})
-    else:
-        lp = (ji.get("lora_path") or ji.get("lora_url") or "").strip()
-        if lp: req_loras.append({"path": lp, "scale": float(ji.get("lora_scale", 0.85)), "adapter_name": "l_0"})
-        alp = (ji.get("additional_lora") or ji.get("additional_lora_path") or ji.get("additional_lora_url") or ji.get("addition_lora") or ji.get("addition_lora_url") or "").strip()
-        if alp:
-            ascl = ji.get("additional_lora_scale") or ji.get("additional_lora_strength") or ji.get("addition_lora_scale") or ji.get("addition_lora_strength") or 0.85
-            req_loras.append({"path": alp, "scale": float(ascl), "adapter_name": "l_1"})
+    req_loras = _collect_requested_loras(ji)
 
     sig = lambda x: tuple((y["path"], y["adapter_name"]) for y in x)
     if pipeline is None or sig(req_loras) != sig(lora_adapters_loaded):
@@ -414,7 +467,7 @@ def handler(job):
         ji = _preprocess_job_input(raw)
         val = validate(ji, INPUT_SCHEMA)
         if "errors" in val: return {"error": str(val["errors"])}
-        return generate_images(val["validated_input"], set(raw.keys()))
+        return generate_images(val["validated_input"])
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
