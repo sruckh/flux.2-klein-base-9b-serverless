@@ -19,7 +19,6 @@ from botocore.exceptions import ClientError
 from diffusers import Flux2KleinPipeline, AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from safetensors.torch import load_file as load_safetensors
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from PIL import Image, ImageFilter
 
 import runpod
@@ -39,6 +38,7 @@ S3_PRESIGNED_URL_EXPIRY = int(os.getenv("S3_PRESIGNED_URL_EXPIRY", "3600"))
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 DEFAULT_MODEL_ID = os.getenv("MODEL_ID", "black-forest-labs/FLUX.2-klein-9B")
 DEVICE = os.getenv("DEVICE", "cuda")
+TEXT_ENCODER_MODE = os.getenv("TEXT_ENCODER_MODE", "official").strip().lower()
 
 # Abliterated text encoder downloaded as a single safetensors file.
 # Transformer, VAE, scheduler, and tokenizer loaded via from_pretrained (uses HF_HOME cache).
@@ -183,45 +183,37 @@ def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     applied = []
     for i, (name, scale) in enumerate(zip(names, scales)):
         applied.append({"adapter_name": name, "effective_scale": scale, "path": adapters[i]["path"]})
-    for comp_name in ["transformer", "text_encoder"]:
-        comp = getattr(pipe, comp_name, None)
-        if comp is not None and hasattr(comp, "set_adapters"):
-            try:
-                comp.set_adapters(names, adapter_weights=scales)
-                for m in comp.modules():
-                    if hasattr(m, "scaling") and hasattr(m, "adapter_name") and m.adapter_name in names:
-                        m.scaling[m.adapter_name] = scales[names.index(m.adapter_name)]
-            except: pass
+    # Flux2LoraLoaderMixin defines LoRA-compatible modules and routes adapter weights internally.
+    pipe.set_adapters(names, adapter_weights=scales)
     return applied
 
 def initialize_pipeline(adapters=None):
-    paths = ensure_models()
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"Loading Components (VRAM: {vram_gb:.1f}GB)...")
 
+    if TEXT_ENCODER_MODE not in {"official", "abliterated"}:
+        raise ValueError(
+            f"Unsupported TEXT_ENCODER_MODE='{TEXT_ENCODER_MODE}'. Use 'official' or 'abliterated'."
+        )
+
     # Load the full pipeline so diffusers resolves the correct transformer class
-    # for FLUX.2-klein-9B's non-standard architecture (to_qkv_mlp_proj fused attn,
-    # double_stream_modulation_img.linear, etc.) that FluxTransformer2DModel doesn't match.
+    # for FLUX.2-klein-9B's architecture (Flux2Transformer2DModel).
     print("Loading Flux2KleinPipeline from pretrained...")
     pipe = Flux2KleinPipeline.from_pretrained(
-        "black-forest-labs/FLUX.2-klein-9B",
+        DEFAULT_MODEL_ID,
         torch_dtype=torch.bfloat16,
         token=HF_TOKEN or None,
     )
 
-    # Swap text encoder: replace the official Qwen3-8B with abliterated weights.
-    # edicamargo repo has weights only (no config.json) — bootstrap config from
-    # Qwen/Qwen3-8B-FP8 on meta device, then assign the abliterated state dict.
-    # Note: float8_e4m3fn cannot be used as a torch default dtype (set_default_dtype
-    # fails), so we init in default dtype and let assign=True set tensor dtypes from file.
-    print("Loading abliterated text encoder...")
-    te_config = AutoConfig.from_pretrained("Qwen/Qwen3-8B-FP8")
-    with torch.device("meta"):
-        text_encoder = AutoModelForCausalLM.from_config(te_config)
-    te_sd = load_safetensors(paths["text_encoder"])
-    text_encoder.load_state_dict(te_sd, strict=True, assign=True)
-    pipe.text_encoder = text_encoder
+    if TEXT_ENCODER_MODE == "abliterated":
+        # Avoid creating meta modules: load custom weights into the instantiated pipeline encoder.
+        paths = ensure_models()
+        print("Applying abliterated text encoder weights...")
+        te_sd = load_safetensors(paths["text_encoder"])
+        pipe.text_encoder.load_state_dict(te_sd, strict=True, assign=True)
+        pipe.text_encoder.eval()
 
+    loaded_adapters = []
     if adapters:
         for l in adapters:
             try:
@@ -232,14 +224,17 @@ def initialize_pipeline(adapters=None):
                         pipe.load_lora_weights(tmp, weight_name="lora.safetensors", adapter_name=l['adapter_name'])
                 else:
                     pipe.load_lora_weights(l['path'], adapter_name=l['adapter_name'])
+                loaded_adapters.append(l)
             except Exception as e:
-                print(f"LoRA Error: {e}")
+                raise RuntimeError(
+                    f"Failed to load LoRA adapter '{l['adapter_name']}' from '{l['path']}': {e}"
+                ) from e
 
-    _set_loras(pipe, adapters)
+    _set_loras(pipe, loaded_adapters)
     pipe.enable_model_cpu_offload()
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
-    return pipe, adapters
+    return pipe, loaded_adapters
 
 def tiled_upscale(image, factor, blend):
     from spandrel import ModelLoader
