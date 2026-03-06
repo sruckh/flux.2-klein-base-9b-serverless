@@ -301,7 +301,11 @@ def generate_images(ji, ef):
     preset = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
     w, h = ji.get("width") or preset["width"], ji.get("height") or preset["height"]
     steps = ji.get("num_inference_steps") or preset["num_inference_steps"]
-    cfg = ji.get("guidance_scale") or preset["guidance_scale"]
+    requested_cfg = ji.get("guidance_scale") or preset["guidance_scale"]
+    cfg = requested_cfg
+    if getattr(getattr(pipeline, "config", None), "is_distilled", False) and cfg > 1.0:
+        print(f"Distilled model active; overriding guidance_scale {cfg} -> 1.0")
+        cfg = 1.0
     shift = ji.get("shift") or preset["shift"]
     max_seq_len = ji.get("max_sequence_length", 512)
 
@@ -323,8 +327,12 @@ def generate_images(ji, ef):
     for img in res.images:
         if ji.get("enable_2nd_pass"):
             _set_loras(pipeline, lora_adapters_loaded, multiplier=ji.get("second_pass_lora_scale_multiplier", 1.0))
+            second_pass_cfg = ji.get("second_pass_guidance_scale", 1.0)
+            if getattr(getattr(pipeline, "config", None), "is_distilled", False) and second_pass_cfg > 1.0:
+                print(f"Distilled model active; overriding second_pass_guidance_scale {second_pass_cfg} -> 1.0")
+                second_pass_cfg = 1.0
             with torch.no_grad():
-                refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 4), guidance_scale=ji.get("second_pass_guidance_scale", 1.0)).images[0]
+                refined = pipeline(prompt=ji["prompt"], image=img, num_inference_steps=ji.get("second_pass_steps", 4), guidance_scale=second_pass_cfg).images[0]
             b_np, r_rgb = np.asarray(img.convert("RGB"), dtype=np.float32), refined.convert("RGB")
             r_low = np.asarray(r_rgb.filter(ImageFilter.GaussianBlur(1.25)), dtype=np.float32)
             diff = (np.asarray(r_rgb, dtype=np.float32) - r_low) * ji.get("second_pass_strength", 0.2)
@@ -335,7 +343,12 @@ def generate_images(ji, ef):
 
     fmt = ji.get("output_format", "jpeg")
     rt = ji.get("return_type", "s3" if S3_BUCKET_NAME else "base64")
-    meta = {"loras": applied, "generation_time": f"{time.time()-start_time:.2f}s"}
+    meta = {
+        "loras": applied,
+        "generation_time": f"{time.time()-start_time:.2f}s",
+        "requested_guidance_scale": requested_cfg,
+        "effective_guidance_scale": cfg,
+    }
 
     if rt == "s3":
         urls = []

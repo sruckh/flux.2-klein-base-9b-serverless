@@ -14,6 +14,7 @@ This README reflects the current `handler.py` implementation on `main`.
   - `abliterated`: load `edicamargo/qwen_3_8b_fp8mixed_abliterated` safetensors into `pipe.text_encoder`
 - LoRA support: load one or multiple adapters, then activate with `pipe.set_adapters(...)`
 - Scheduler: recreated per request with configurable `shift`
+- Distilled guidance handling: requested guidance values above `1.0` are clamped to `1.0` (first pass and second pass)
 - Generation context: `torch.no_grad()`
 - Output: S3 presigned URL (if configured) or base64
 
@@ -115,7 +116,8 @@ Current presets in code:
 ## Distilled Model Notes
 
 - This worker targets the distilled FLUX.2-klein-9B path.
-- In practice, guidance values above `1.0` may be ignored by the pipeline for distilled behavior (you may see a runtime warning indicating this).
+- Guidance values above `1.0` are clamped to `1.0` before pipeline calls (first pass and second pass).
+- Response metadata includes `requested_guidance_scale` and `effective_guidance_scale`.
 
 ## Environment Variables
 
@@ -145,6 +147,7 @@ Current presets in code:
 - If `return_type == "s3"`, worker attempts S3 upload first.
 - If S3 upload fails, worker falls back to base64 per image.
 - If fallback base64 payload exceeds size guard (`> ~1.8MB` string), returns an error.
+- Metadata includes LoRA application info, generation time, and requested/effective guidance scale.
 
 ## LoRA Error Handling
 
