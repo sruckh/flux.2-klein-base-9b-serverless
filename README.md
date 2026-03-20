@@ -12,7 +12,7 @@ This README reflects the current `handler.py` implementation on `main`.
 - Text encoder mode:
   - `official` (default): use encoder from model repo
   - `abliterated`: load `edicamargo/qwen_3_8b_fp8mixed_abliterated` safetensors into `pipe.text_encoder`
-- LoRA support: load one or multiple adapters, then activate with `pipe.set_adapters(...)`
+- LoRA support: load one or multiple adapters, activate with `pipe.set_adapters(...)`, and pass `joint_attention_kwargs={"scale": 1.0}` on every pipeline call so the FLUX attention processor picks up the per-adapter scales
 - Scheduler: recreated per request with configurable `shift`
 - Distilled guidance handling: requested guidance values above `1.0` are clamped to `1.0` (first pass and second pass)
 - Generation context: `torch.no_grad()`
@@ -38,8 +38,9 @@ For each request:
 2. Resolve requested LoRA stack.
 3. Reinitialize pipeline if the adapter stack signature changed (`path` + `adapter_name`).
 4. Rebuild scheduler with request/preset shift.
-5. Generate first-pass images.
-6. Optional second pass (img2img) with optional LoRA scale multiplier.
+5. Re-apply adapter scales via `set_adapters()`.
+6. Generate first-pass images (with `joint_attention_kwargs={"scale": 1.0}`).
+7. Optional second pass (img2img) with optional LoRA scale multiplier (also uses `joint_attention_kwargs`).
 7. Optional tiled upscale.
 8. Return S3 URLs or base64.
 
@@ -77,7 +78,7 @@ Multi-LoRA (preferred):
 - `loras` (`list`, default `[]`)
   - each item supports:
     - `path` (or aliases: `url`, `lora_url`, `lora_path`)
-    - `scale` (or aliases: `strength`, `weight`, `lora_scale`)
+    - `scale` (or aliases: `strength`, `weight`, `lora_scale`) — `0.0` is a valid value and is preserved as-is
     - `adapter_name` (optional; auto-generated if omitted)
     - `weight_name` (optional; useful when loading from HF repo paths)
 
@@ -193,18 +194,47 @@ Use GitHub integration against this repository. Pushes to `main` trigger rebuild
 
 ## Example Request
 
+Single LoRA:
+
 ```json
 {
   "input": {
     "prompt": "TOK woman, close-up portrait, soft window light",
     "preset": "portrait_hd",
     "seed": 42,
-    "num_images": 1,
     "loras": [
       {
         "path": "https://example.com/character.safetensors",
         "scale": 0.85,
         "adapter_name": "character"
+      }
+    ],
+    "enable_2nd_pass": true,
+    "second_pass_steps": 4,
+    "output_format": "jpeg",
+    "return_type": "s3"
+  }
+}
+```
+
+Multiple LoRAs (stacked):
+
+```json
+{
+  "input": {
+    "prompt": "TOK woman, close-up portrait, soft window light",
+    "preset": "portrait_hd",
+    "seed": 42,
+    "loras": [
+      {
+        "path": "https://example.com/character.safetensors",
+        "scale": 0.9,
+        "adapter_name": "character"
+      },
+      {
+        "path": "https://example.com/style.safetensors",
+        "scale": 0.6,
+        "adapter_name": "style"
       }
     ],
     "lora_scale_mode": "absolute",
@@ -233,6 +263,10 @@ Resolved in current code path by avoiding meta-instantiated text encoder replace
 ### "Setting requires_grad=True on inference tensor outside InferenceMode"
 
 Resolved by using `torch.no_grad()` in generation paths where adapter switching can occur between passes.
+
+### Second (or additional) LoRA has no visible effect
+
+FLUX-family pipelines require `joint_attention_kwargs={"scale": 1.0}` to be passed on every pipeline `__call__` for the attention processor to apply the per-adapter scales set by `set_adapters()`. Without it, adapters are loaded and registered but their scale is not picked up during the forward pass. Both pipeline calls in `generate_images` now include this kwarg.
 
 ## Reference Links
 
