@@ -401,7 +401,7 @@ def generate_images(ji):
             generator=torch.Generator(DEVICE).manual_seed(seed),
             num_images_per_prompt=ji.get("num_images", 1),
             max_sequence_length=max_seq_len,
-            joint_attention_kwargs={"scale": 1.0},
+            attention_kwargs={"scale": 1.0},
         )
 
     final = []
@@ -435,7 +435,7 @@ def generate_images(ji):
                     num_inference_steps=second_pass_steps,
                     guidance_scale=second_pass_cfg,
                     generator=torch.Generator(DEVICE).manual_seed(seed),
-                    joint_attention_kwargs={"scale": 1.0},
+                    attention_kwargs={"scale": 1.0},
                 ).images[0]
             img = _detail_only_blend(img.convert("RGB"), refined.convert("RGB"), ji.get("second_pass_strength", 0.2))
         if ji.get("enable_upscale"):

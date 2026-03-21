@@ -12,7 +12,7 @@ This README reflects the current `handler.py` implementation on `main`.
 - Text encoder mode:
   - `official` (default): use encoder from model repo
   - `abliterated`: load `edicamargo/qwen_3_8b_fp8mixed_abliterated` safetensors into `pipe.text_encoder`
-- LoRA support: load one or multiple adapters, activate with `pipe.set_adapters(...)`, and pass `joint_attention_kwargs={"scale": 1.0}` on every pipeline call so the FLUX attention processor picks up the per-adapter scales
+- LoRA support: load one or multiple adapters, activate with `pipe.set_adapters(...)`, and pass `attention_kwargs={"scale": 1.0}` on every pipeline call so the FLUX attention processor picks up the per-adapter scales
 - Scheduler: recreated per request with configurable `shift`
 - Distilled guidance handling: requested guidance values above `1.0` are clamped to `1.0` (first pass and second pass)
 - Generation context: `torch.no_grad()`
@@ -39,8 +39,8 @@ For each request:
 3. Reinitialize pipeline if the adapter stack signature changed (`path` + `adapter_name`).
 4. Rebuild scheduler with request/preset shift.
 5. Re-apply adapter scales via `set_adapters()`.
-6. Generate first-pass images (with `joint_attention_kwargs={"scale": 1.0}`).
-7. Optional second pass (img2img) with optional LoRA scale multiplier (also uses `joint_attention_kwargs`).
+6. Generate first-pass images (with `attention_kwargs={"scale": 1.0}`).
+7. Optional second pass (img2img) with optional LoRA scale multiplier (also uses `attention_kwargs`).
 7. Optional tiled upscale.
 8. Return S3 URLs or base64.
 
@@ -266,7 +266,7 @@ Resolved by using `torch.no_grad()` in generation paths where adapter switching 
 
 ### Second (or additional) LoRA has no visible effect
 
-FLUX-family pipelines require `joint_attention_kwargs={"scale": 1.0}` to be passed on every pipeline `__call__` for the attention processor to apply the per-adapter scales set by `set_adapters()`. Without it, adapters are loaded and registered but their scale is not picked up during the forward pass. Both pipeline calls in `generate_images` now include this kwarg.
+`Flux2KleinPipeline.__call__()` takes `attention_kwargs` (not `joint_attention_kwargs` — that is an internal transformer parameter). Pass `attention_kwargs={"scale": 1.0}` on every pipeline call for the attention processor to apply the per-adapter scales set by `set_adapters()`. Without it, adapters are loaded and registered but their scale is not picked up during the forward pass. Both pipeline calls in `generate_images` include this kwarg.
 
 ## Reference Links
 
