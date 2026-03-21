@@ -55,6 +55,7 @@ UPSCALER_MODEL_PATH = "/runpod-volume/models/4xRealWebPhoto_v4_drct-l.pth"
 # Globals
 pipeline = None
 lora_adapters_loaded = []
+_last_lora_mode = "absolute"
 upscaler_model = None
 
 # ============================================================================
@@ -238,7 +239,7 @@ def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     pipe.set_adapters(names, adapter_weights=scales)
     return applied
 
-def initialize_pipeline(adapters=None):
+def initialize_pipeline(adapters=None, scale_mode="absolute"):
     vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     print(f"Loading Components (VRAM: {vram_gb:.1f}GB)...")
 
@@ -284,17 +285,16 @@ def initialize_pipeline(adapters=None):
                     f"Failed to load LoRA adapter '{l['adapter_name']}' from '{l['path']}': {e}"
                 ) from e
 
-    if loaded_adapters and hasattr(pipe, "get_list_adapters"):
-        list_adapters = pipe.get_list_adapters()
-        transformer_adapters = set(list_adapters.get("transformer", []))
-        missing = [a["adapter_name"] for a in loaded_adapters if a["adapter_name"] not in transformer_adapters]
-        if missing:
-            raise RuntimeError(
-                f"LoRA adapter(s) loaded but not registered on transformer: {missing}. "
-                "Check LoRA format compatibility (Flux2 transformer LoRA expected)."
-            )
+    if loaded_adapters:
+        names = [a["adapter_name"] for a in loaded_adapters]
+        scales = [float(a["scale"]) for a in loaded_adapters]
+        if scale_mode == "normalized" and sum(scales) > 0:
+            total = sum(scales)
+            scales = [s / total for s in scales]
+        pipe.set_adapters(names, adapter_weights=scales)
+        pipe.fuse_lora(adapter_names=names, lora_scale=1.0)
+        pipe.unload_lora_weights()
 
-    _set_loras(pipe, loaded_adapters)
     pipe.enable_model_cpu_offload()
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
@@ -364,16 +364,18 @@ def tiled_upscale(image, factor, blend):
     return res_img
 
 def generate_images(ji):
-    global pipeline, lora_adapters_loaded
+    global pipeline, lora_adapters_loaded, _last_lora_mode
     req_loras = _collect_requested_loras(ji)
+    mode = ji.get("lora_scale_mode", "absolute")
 
-    sig = lambda x: tuple((y["path"], y["adapter_name"]) for y in x)
-    if pipeline is None or sig(req_loras) != sig(lora_adapters_loaded):
+    sig = lambda x, m: tuple((y["path"], y["adapter_name"], round(float(y["scale"]), 4)) for y in x) + (m,)
+    if pipeline is None or sig(req_loras, mode) != sig(lora_adapters_loaded, _last_lora_mode):
         print("Resetting VRAM for model change...")
         pipeline = None
         import gc
         for _ in range(3): gc.collect(); torch.cuda.empty_cache()
-        pipeline, lora_adapters_loaded = initialize_pipeline(req_loras)
+        pipeline, lora_adapters_loaded = initialize_pipeline(req_loras, scale_mode=mode)
+        _last_lora_mode = mode
 
     preset = PRESETS.get(ji.get("preset"), PRESETS["realistic_character"]).copy()
     w, h = ji.get("width") or preset["width"], ji.get("height") or preset["height"]
@@ -387,7 +389,7 @@ def generate_images(ji):
     max_seq_len = ji.get("max_sequence_length", 512)
 
     pipeline.scheduler = FlowMatchEulerDiscreteScheduler.from_config(pipeline.scheduler.config, shift=shift)
-    applied = _set_loras(pipeline, lora_adapters_loaded, mode=ji.get("lora_scale_mode", "absolute"))
+    applied = [{"adapter_name": a["adapter_name"], "effective_scale": float(a["scale"]), "path": a["path"]} for a in lora_adapters_loaded]
 
     print(f"Inference: {w}x{h}, {steps} steps, CFG {cfg}")
     start_time = time.time()
@@ -401,23 +403,18 @@ def generate_images(ji):
             generator=torch.Generator(DEVICE).manual_seed(seed),
             num_images_per_prompt=ji.get("num_images", 1),
             max_sequence_length=max_seq_len,
-            attention_kwargs={"scale": 1.0},
         )
 
     final = []
     for img in res.images:
-        if ji.get("enable_2nd_pass"):
-            second_pass_multiplier = float(ji.get("second_pass_lora_scale_multiplier", 1.0))
-            if second_pass_multiplier > 1.0:
-                print(f"Detail-only second pass: clamping second_pass_lora_scale_multiplier {second_pass_multiplier} -> 1.0")
-                second_pass_multiplier = 1.0
-            if second_pass_multiplier < 0.0:
-                print(f"Detail-only second pass: clamping second_pass_lora_scale_multiplier {second_pass_multiplier} -> 0.0")
-                second_pass_multiplier = 0.0
-            _set_loras(pipeline, lora_adapters_loaded, multiplier=second_pass_multiplier)
+        # STEP 1: SR upscale first (before second pass)
+        if ji.get("enable_upscale"):
+            img = tiled_upscale(img, ji.get("upscale_factor", 2.0), ji.get("upscale_blend", 0.35))
 
+        # STEP 2: FLUX second pass at (potentially upscaled) resolution
+        if ji.get("enable_2nd_pass"):
             requested_second_pass_steps = int(ji.get("second_pass_steps", 4))
-            second_pass_steps = max(1, min(requested_second_pass_steps, 4))
+            second_pass_steps = max(1, min(requested_second_pass_steps, 8))
             if second_pass_steps != requested_second_pass_steps:
                 print(f"Detail-only second pass: clamping second_pass_steps {requested_second_pass_steps} -> {second_pass_steps}")
 
@@ -435,11 +432,9 @@ def generate_images(ji):
                     num_inference_steps=second_pass_steps,
                     guidance_scale=second_pass_cfg,
                     generator=torch.Generator(DEVICE).manual_seed(seed),
-                    attention_kwargs={"scale": 1.0},
                 ).images[0]
             img = _detail_only_blend(img.convert("RGB"), refined.convert("RGB"), ji.get("second_pass_strength", 0.2))
-        if ji.get("enable_upscale"):
-            img = tiled_upscale(img, ji.get("upscale_factor", 2.0), ji.get("upscale_blend", 0.35))
+
         final.append(img)
 
     fmt = ji.get("output_format", "jpeg")

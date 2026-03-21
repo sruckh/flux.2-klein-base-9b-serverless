@@ -12,7 +12,7 @@ This README reflects the current `handler.py` implementation on `main`.
 - Text encoder mode:
   - `official` (default): use encoder from model repo
   - `abliterated`: load `edicamargo/qwen_3_8b_fp8mixed_abliterated` safetensors into `pipe.text_encoder`
-- LoRA support: load one or multiple adapters, activate with `pipe.set_adapters(...)`, and pass `attention_kwargs={"scale": 1.0}` on every pipeline call so the FLUX attention processor picks up the per-adapter scales
+- LoRA support: load one or multiple adapters, fuse weights into model tensors via `fuse_lora()` at init time so scales are baked in — no per-request `set_adapters` or `attention_kwargs` needed
 - Scheduler: recreated per request with configurable `shift`
 - Distilled guidance handling: requested guidance values above `1.0` are clamped to `1.0` (first pass and second pass)
 - Generation context: `torch.no_grad()`
@@ -27,7 +27,7 @@ On first request (or when LoRA stack changes):
 1. Build `Flux2KleinPipeline` from `MODEL_ID`.
 2. If `TEXT_ENCODER_MODE=abliterated`, download and apply abliterated text encoder weights.
 3. Load requested LoRA adapters.
-4. Activate adapters with effective scales.
+4. Fuse adapter weights into model tensors (`set_adapters` → `fuse_lora` → `unload_lora_weights`). Scale and mode are baked in; scale changes require pipeline reload.
 5. Enable `pipe.enable_model_cpu_offload()` and VAE slicing/tiling.
 
 ### Request-Time Flow
@@ -36,19 +36,17 @@ For each request:
 
 1. Validate input against schema.
 2. Resolve requested LoRA stack.
-3. Reinitialize pipeline if the adapter stack signature changed (`path` + `adapter_name`).
+3. Reinitialize pipeline if the adapter stack signature changed (`path` + `adapter_name` + `scale` + `lora_scale_mode`).
 4. Rebuild scheduler with request/preset shift.
-5. Re-apply adapter scales via `set_adapters()`.
-6. Generate first-pass images (with `attention_kwargs={"scale": 1.0}`).
-7. Optional second pass (img2img) with optional LoRA scale multiplier (also uses `attention_kwargs`).
-7. Optional tiled upscale.
+5. Generate first-pass images (LoRA scales already fused — no `attention_kwargs` needed).
+6. Optional tiled SR upscale (runs **before** second pass).
+7. Optional second pass (img2img at upscaled resolution if upscale was enabled).
 8. Return S3 URLs or base64.
 
 Second-pass detail mode guardrails:
 
-- `second_pass_steps` is clamped to `1..4`.
+- `second_pass_steps` is clamped to `1..8` (higher cap when running at upscaled resolution).
 - `second_pass_guidance_scale` is forced to `1.0`.
-- `second_pass_lora_scale_multiplier` is clamped to `0.0..1.0`.
 - Only luminance high-frequency detail is blended back into the base image (color/composition remain from pass 1).
 
 ## Input Parameters
@@ -102,9 +100,8 @@ LoRA scaling mode:
 
 - `enable_2nd_pass` (`bool`, default `false`)
 - `second_pass_strength` (`float`, default `0.2`)
-- `second_pass_steps` (`int`, default `4`, runtime clamp `1..4`)
+- `second_pass_steps` (`int`, default `4`, runtime clamp `1..8`)
 - `second_pass_guidance_scale` (`float`, default `1.0`, runtime forced to `1.0`)
-- `second_pass_lora_scale_multiplier` (`float`, default `1.0`, runtime clamp `0.0..1.0`)
 
 ### Upscale
 
@@ -169,7 +166,7 @@ LoRA load failures are fatal for the request:
 
 - Worker raises a runtime error that includes adapter name and source path.
 - This avoids silent generation with missing adapters.
-- Worker validates that each requested adapter is actually registered on the Flux2 `transformer` before inference.
+- LoRA weights are fused into the model at init time; a load failure raises immediately before any inference occurs.
 
 ## Deployment
 
@@ -238,10 +235,9 @@ Multiple LoRAs (stacked):
       }
     ],
     "lora_scale_mode": "absolute",
+    "enable_upscale": true,
     "enable_2nd_pass": true,
     "second_pass_steps": 4,
-    "second_pass_lora_scale_multiplier": 0.8,
-    "enable_upscale": false,
     "output_format": "jpeg",
     "return_type": "s3"
   }
@@ -266,7 +262,7 @@ Resolved by using `torch.no_grad()` in generation paths where adapter switching 
 
 ### Second (or additional) LoRA has no visible effect
 
-`Flux2KleinPipeline.__call__()` takes `attention_kwargs` (not `joint_attention_kwargs` — that is an internal transformer parameter). Pass `attention_kwargs={"scale": 1.0}` on every pipeline call for the attention processor to apply the per-adapter scales set by `set_adapters()`. Without it, adapters are loaded and registered but their scale is not picked up during the forward pass. Both pipeline calls in `generate_images` include this kwarg.
+LoRA scales are now baked into model weights at init time using `fuse_lora()`. If a LoRA appears to have no effect, verify the `scale` value is non-zero and that the adapter loaded without error. Scale changes (same paths, different scale values) now correctly trigger a full pipeline reload because the scale is part of the reload signature.
 
 ## Reference Links
 
