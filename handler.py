@@ -57,6 +57,8 @@ pipeline = None
 lora_adapters_loaded = []
 _last_lora_mode = "absolute"
 upscaler_model = None
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+DOWNLOAD_MAX_RETRIES = 3
 
 # ============================================================================
 # Schema & Presets
@@ -225,6 +227,58 @@ def _collect_requested_loras(ji):
 
     return adapters
 
+def _download_file(url, dest_path, chunk_size=DOWNLOAD_CHUNK_SIZE, retries=DOWNLOAD_MAX_RETRIES):
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        tmp_path = f"{dest_path}.part"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "flux.2-klein-serverless/1.0",
+                    "Accept": "*/*",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=300) as response, open(tmp_path, "wb") as out:
+                expected_length = response.headers.get("Content-Length")
+                expected_length = int(expected_length) if expected_length else None
+                downloaded = 0
+
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+
+                out.flush()
+
+            if expected_length is not None and downloaded != expected_length:
+                raise IOError(
+                    f"retrieval incomplete: got only {downloaded} out of {expected_length} bytes"
+                )
+
+            os.replace(tmp_path, dest_path)
+            return dest_path
+        except Exception as exc:
+            last_error = exc
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+
+            if attempt < retries:
+                sleep_seconds = min(2 ** (attempt - 1), 8)
+                print(
+                    f"LoRA download retry {attempt}/{retries} failed for {url}: {exc}. "
+                    f"Retrying in {sleep_seconds}s..."
+                )
+                time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Failed to download LoRA from '{url}' after {retries} attempts: {last_error}")
+
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if not adapters: return []
     scales = [float(a["scale"]) * multiplier for a in adapters]
@@ -272,7 +326,7 @@ def initialize_pipeline(adapters=None, scale_mode="absolute"):
                 if l['path'].startswith("http"):
                     with tempfile.TemporaryDirectory() as tmp:
                         p = os.path.join(tmp, "lora.safetensors")
-                        urllib.request.urlretrieve(l['path'], p)
+                        _download_file(l["path"], p)
                         pipe.load_lora_weights(tmp, weight_name="lora.safetensors", adapter_name=l['adapter_name'])
                 else:
                     load_kwargs = {"adapter_name": l["adapter_name"]}
