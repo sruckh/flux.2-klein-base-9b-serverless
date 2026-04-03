@@ -18,6 +18,7 @@ import torch
 from botocore.exceptions import ClientError
 from diffusers import Flux2KleinPipeline, AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors
 from PIL import Image, ImageFilter
 
@@ -279,6 +280,45 @@ def _download_file(url, dest_path, chunk_size=DOWNLOAD_CHUNK_SIZE, retries=DOWNL
 
     raise RuntimeError(f"Failed to download LoRA from '{url}' after {retries} attempts: {last_error}")
 
+def _classify_adapter_checkpoint(adapter_path):
+    try:
+        with safe_open(adapter_path, framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+    except Exception:
+        return None
+
+    if not keys:
+        return None
+
+    lowered = [k.lower() for k in keys]
+    if any(".lokr_" in k or k.endswith("lokr_w1") or k.endswith("lokr_w2") for k in lowered):
+        return "lokr"
+    if any(".hada_" in k or ".hada_w" in k for k in lowered):
+        return "hada"
+    if any(".lora_" in k or ".dora_" in k or ".lora_up." in k or ".lora_down." in k for k in lowered):
+        return "lora"
+    if any(".locon_" in k for k in lowered):
+        return "locon"
+    return "unknown"
+
+def _resolve_adapter_file(path, weight_name=None):
+    if os.path.isfile(path):
+        return path
+    if weight_name and os.path.isdir(path):
+        candidate = os.path.join(path, weight_name)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+def _validate_adapter_checkpoint(adapter_path, adapter_name, source_path):
+    adapter_type = _classify_adapter_checkpoint(adapter_path)
+    if adapter_type in {"lokr", "hada"}:
+        raise ValueError(
+            f"Adapter '{adapter_name}' from '{source_path}' is a LyCORIS/{adapter_type.upper()} checkpoint, "
+            "which this server cannot load with diffusers `load_lora_weights()`. "
+            "Use a standard FLUX LoRA/LoCon safetensors file instead."
+        )
+
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if not adapters: return []
     scales = [float(a["scale"]) * multiplier for a in adapters]
@@ -327,11 +367,15 @@ def initialize_pipeline(adapters=None, scale_mode="absolute"):
                     with tempfile.TemporaryDirectory() as tmp:
                         p = os.path.join(tmp, "lora.safetensors")
                         _download_file(l["path"], p)
+                        _validate_adapter_checkpoint(p, l["adapter_name"], l["path"])
                         pipe.load_lora_weights(tmp, weight_name="lora.safetensors", adapter_name=l['adapter_name'])
                 else:
                     load_kwargs = {"adapter_name": l["adapter_name"]}
                     if l.get("weight_name"):
                         load_kwargs["weight_name"] = l["weight_name"]
+                    adapter_file = _resolve_adapter_file(l["path"], l.get("weight_name"))
+                    if adapter_file:
+                        _validate_adapter_checkpoint(adapter_file, l["adapter_name"], l["path"])
                     pipe.load_lora_weights(l['path'], **load_kwargs)
                 loaded_adapters.append(l)
             except Exception as e:
