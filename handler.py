@@ -324,10 +324,10 @@ def _sanitize_adapter_checkpoint_for_diffusers(adapter_path):
         with safe_open(adapter_path, framework="pt", device="cpu") as f:
             keys = list(f.keys())
     except Exception:
-        return adapter_path
+        return None
 
     if not keys:
-        return adapter_path
+        return None
 
     non_lora_keys = [k for k in keys if "lora" not in k.lower()]
     # OneTrainer FLUX LoRAs include valid `.alpha` tensors alongside
@@ -335,16 +335,18 @@ def _sanitize_adapter_checkpoint_for_diffusers(adapter_path):
     # checkpoints unless every key contains `lora`. Strip only those alpha
     # tensors for compatibility; keep the original file untouched.
     if not non_lora_keys or any(not k.endswith(".alpha") for k in non_lora_keys):
-        return adapter_path
+        return None
 
     state_dict = load_safetensors(adapter_path)
     filtered = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
-    sanitized_path = os.path.join(tempfile.mkdtemp(prefix="lora_sanitize_"), os.path.basename(adapter_path))
+    sanitized_dir = tempfile.mkdtemp(prefix="lora_sanitize_")
+    sanitized_name = os.path.basename(adapter_path)
+    sanitized_path = os.path.join(sanitized_dir, sanitized_name)
     save_safetensors(filtered, sanitized_path)
     print(
         f"Sanitized LoRA checkpoint for diffusers compatibility: removed {len(state_dict) - len(filtered)} alpha tensors"
     )
-    return sanitized_path
+    return {"dir": sanitized_dir, "weight_name": sanitized_name}
 
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
     if not adapters: return []
@@ -396,10 +398,14 @@ def initialize_pipeline(adapters=None, scale_mode="absolute"):
                         _download_file(l["path"], p)
                         _validate_adapter_checkpoint(p, l["adapter_name"], l["path"])
                         sanitized = _sanitize_adapter_checkpoint_for_diffusers(p)
-                        if sanitized == p:
+                        if sanitized is None:
                             pipe.load_lora_weights(tmp, weight_name="lora.safetensors", adapter_name=l['adapter_name'])
                         else:
-                            pipe.load_lora_weights(sanitized, adapter_name=l['adapter_name'])
+                            pipe.load_lora_weights(
+                                sanitized["dir"],
+                                weight_name=sanitized["weight_name"],
+                                adapter_name=l['adapter_name'],
+                            )
                 else:
                     load_kwargs = {"adapter_name": l["adapter_name"]}
                     if l.get("weight_name"):
@@ -408,8 +414,12 @@ def initialize_pipeline(adapters=None, scale_mode="absolute"):
                     if adapter_file:
                         _validate_adapter_checkpoint(adapter_file, l["adapter_name"], l["path"])
                         sanitized = _sanitize_adapter_checkpoint_for_diffusers(adapter_file)
-                        if sanitized != adapter_file:
-                            pipe.load_lora_weights(sanitized, adapter_name=l["adapter_name"])
+                        if sanitized is not None:
+                            pipe.load_lora_weights(
+                                sanitized["dir"],
+                                weight_name=sanitized["weight_name"],
+                                adapter_name=l["adapter_name"],
+                            )
                             loaded_adapters.append(l)
                             continue
                     pipe.load_lora_weights(l['path'], **load_kwargs)
