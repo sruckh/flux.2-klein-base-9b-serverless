@@ -33,3 +33,10 @@ lora/
 # Logs
 *.log
 *.jpg
+
+# Local notes / codex
+LORA_DL_MAX.md
+.codex
+
+# Local LoRA test files
+*.safetensors

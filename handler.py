@@ -337,15 +337,37 @@ def _sanitize_adapter_checkpoint_for_diffusers(adapter_path):
     if not non_lora_keys or any(not k.endswith(".alpha") for k in non_lora_keys):
         return None
 
+    # OneTrainer "diffusers dot-notation" format: keys start with `transformer.`
+    # and use `lora_down`/`lora_up` instead of PEFT's `lora_A`/`lora_B`.
+    # diffusers `load_lora_weights` only recognises kohya (`lora_unet_*`) and
+    # PEFT (`.lora_A.`) formats; encountering `transformer.*.lora_down.*` keys
+    # causes it to misroute to the kohya converter which raises
+    # `list index out of range` while parsing the incompatible key structure.
+    # Rename to PEFT convention so diffusers loads the weights directly.
+    is_onetrainer_dot_format = (
+        any(k.startswith("transformer.") for k in keys)
+        and any(".lora_down." in k for k in keys)
+        and not any(".lora_A." in k for k in keys)
+    )
+
     state_dict = load_safetensors(adapter_path)
     filtered = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
-    sanitized_dir = tempfile.mkdtemp(prefix="lora_sanitize_")
-    sanitized_name = os.path.basename(adapter_path)
-    sanitized_path = os.path.join(sanitized_dir, sanitized_name)
-    save_safetensors(filtered, sanitized_path)
-    print(
-        f"Sanitized LoRA checkpoint for diffusers compatibility: removed {len(state_dict) - len(filtered)} alpha tensors"
-    )
+    alpha_removed = len(state_dict) - len(filtered)
+
+    if is_onetrainer_dot_format:
+        filtered = {
+            k.replace(".lora_down.", ".lora_A.").replace(".lora_up.", ".lora_B."): v
+            for k, v in filtered.items()
+        }
+        print(
+            f"Sanitized LoRA checkpoint for diffusers compatibility: "
+            f"removed {alpha_removed} alpha tensors, "
+            f"renamed lora_down/lora_up to lora_A/lora_B (OneTrainer dot format)"
+        )
+    else:
+        print(
+            f"Sanitized LoRA checkpoint for diffusers compatibility: removed {alpha_removed} alpha tensors"
+        )
     return {"dir": sanitized_dir, "weight_name": sanitized_name}
 
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):

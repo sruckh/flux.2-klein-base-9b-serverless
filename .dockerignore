@@ -37,3 +37,6 @@ models/
 output/
 test_*.png
 test_*.jpg
+
+# Local notes / codex
+.codex
