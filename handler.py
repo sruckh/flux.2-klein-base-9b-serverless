@@ -368,6 +368,11 @@ def _sanitize_adapter_checkpoint_for_diffusers(adapter_path):
         print(
             f"Sanitized LoRA checkpoint for diffusers compatibility: removed {alpha_removed} alpha tensors"
         )
+
+    sanitized_dir = tempfile.mkdtemp(prefix="lora_sanitize_")
+    sanitized_name = os.path.basename(adapter_path)
+    sanitized_path = os.path.join(sanitized_dir, sanitized_name)
+    save_safetensors(filtered, sanitized_path)
     return {"dir": sanitized_dir, "weight_name": sanitized_name}
 
 def _set_loras(pipe, adapters, mode="absolute", multiplier=1.0):
